@@ -1,6 +1,10 @@
 """
-Generates realistic synthetic Nifty50 5-minute intraday OHLCV data.
-Used when no real historical data CSV is available.
+Data loading utilities for Nifty50 intraday backtesting.
+
+Supports:
+  - Loading 1-minute CSV data and resampling to 5-minute candles
+  - Loading pre-aggregated 5-minute CSV data
+  - Generating synthetic 5-minute OHLC data (no volume) for testing
 """
 
 import pandas as pd
@@ -26,6 +30,43 @@ def _business_days(start: str, end: str) -> list[datetime]:
     return [d.to_pydatetime() for d in dates]
 
 
+def resample_1min_to_5min(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample 1-minute OHLC data to 5-minute candles.
+
+    Expects columns: datetime, open, high, low, close
+    The datetime column must already be parsed as datetime.
+    Groups by date first, then resamples within each day so overnight
+    gaps don't merge candles across days.
+    """
+    df = df.copy().sort_values("datetime").reset_index(drop=True)
+    df = df.set_index("datetime")
+
+    agg_rules = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }
+
+    resampled = (
+        df.resample("5min", offset="0min")
+        .agg(agg_rules)
+        .dropna(subset=["open"])
+        .reset_index()
+    )
+
+    resampled["date"] = resampled["datetime"].dt.strftime("%Y-%m-%d")
+    resampled["time"] = resampled["datetime"].dt.strftime("%H:%M")
+
+    # Keep only market hours (09:15 – 15:29)
+    resampled = resampled[
+        (resampled["time"] >= "09:15") & (resampled["time"] <= "15:25")
+    ].reset_index(drop=True)
+
+    return resampled
+
+
 def generate_intraday_data(
     start_date: str = "2024-01-01",
     end_date: str = "2024-12-31",
@@ -33,10 +74,10 @@ def generate_intraday_data(
     seed: int = 42,
 ) -> pd.DataFrame:
     """
-    Generate synthetic 5-min OHLCV data for Nifty50 spot.
+    Generate synthetic 5-min OHLC data for Nifty50 spot (no volume).
 
     Returns a DataFrame with columns:
-        datetime, date, time, open, high, low, close, volume
+        datetime, date, time, open, high, low, close
     """
     rng = np.random.RandomState(seed)
     days = _business_days(start_date, end_date)
@@ -45,9 +86,8 @@ def generate_intraday_data(
     price = base_price
 
     for day in days:
-        daily_drift = rng.normal(0, 0.003)  # daily bias
-        daily_vol = rng.uniform(0.001, 0.004)  # intraday vol per candle
-        day_open = price
+        daily_drift = rng.normal(0, 0.003)
+        daily_vol = rng.uniform(0.001, 0.004)
 
         for idx, ts in enumerate(time_slots):
             candle_return = daily_drift / len(time_slots) + rng.normal(0, daily_vol)
@@ -58,17 +98,6 @@ def generate_intraday_data(
             wick_dn = abs(rng.normal(0, daily_vol * 0.5))
             h = max(o, c) * (1 + wick_up)
             l = min(o, c) * (1 - wick_dn)
-
-            # Volume pattern: higher at open/close, lower midday
-            hour = int(ts.split(":")[0])
-            minute = int(ts.split(":")[1])
-            if hour == 9 and minute < 45:
-                vol_mult = rng.uniform(1.5, 3.0)
-            elif hour >= 14 and minute >= 30:
-                vol_mult = rng.uniform(1.2, 2.5)
-            else:
-                vol_mult = rng.uniform(0.5, 1.2)
-            volume = int(rng.uniform(50000, 200000) * vol_mult)
 
             dt = day.replace(
                 hour=int(ts.split(":")[0]),
@@ -84,7 +113,6 @@ def generate_intraday_data(
                     "high": round(h, 2),
                     "low": round(l, 2),
                     "close": round(c, 2),
-                    "volume": volume,
                 }
             )
             price = c
@@ -94,24 +122,3 @@ def generate_intraday_data(
 
     df = pd.DataFrame(rows)
     return df
-
-
-def load_or_generate(
-    csv_path: str | None = None,
-    start_date: str = "2024-01-01",
-    end_date: str = "2024-12-31",
-) -> pd.DataFrame:
-    """
-    Load data from CSV if available, otherwise generate synthetic data.
-
-    Expected CSV columns: datetime, open, high, low, close, volume
-    """
-    if csv_path:
-        df = pd.read_csv(csv_path, parse_dates=["datetime"])
-        if "date" not in df.columns:
-            df["date"] = df["datetime"].dt.strftime("%Y-%m-%d")
-        if "time" not in df.columns:
-            df["time"] = df["datetime"].dt.strftime("%H:%M")
-        return df
-
-    return generate_intraday_data(start_date=start_date, end_date=end_date)

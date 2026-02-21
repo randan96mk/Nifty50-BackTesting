@@ -1,8 +1,10 @@
 """
 Nifty50 Intraday Backtesting Dashboard
 =======================================
-Streamlit UI for backtesting ORB and VWAP Pullback strategies
-on Nifty50 5-minute candle data.
+Streamlit UI for backtesting ORB and EMA Pullback strategies
+on Nifty50 5-minute candle data (no volume required).
+
+Supports uploading 1-minute CSV data (auto-resampled to 5-min).
 
 Run:  streamlit run app.py
 """
@@ -14,7 +16,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from strategies import backtest, compute_metrics
-from data_generator import generate_intraday_data
+from data_generator import generate_intraday_data, resample_1min_to_5min
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,14 +43,14 @@ if data_source == "Upload CSV File":
     st.sidebar.markdown(
         """
         **Expected CSV columns:**
-        `datetime, open, high, low, close, volume`
+        `datetime, open, high, low, close`
 
-        - `datetime` format: `YYYY-MM-DD HH:MM:SS`
-        - 5-minute intraday candles
-        - Nifty50 spot data
+        - Supports **1-minute** or **5-minute** candles
+        - 1-min data is auto-resampled to 5-min
+        - Volume column is optional (not used)
         """
     )
-    uploaded = st.sidebar.file_uploader("Upload 5-min OHLCV CSV", type=["csv"])
+    uploaded = st.sidebar.file_uploader("Upload OHLC CSV", type=["csv"])
     if uploaded is not None:
         df = pd.read_csv(uploaded)
         # Normalize column names to lowercase
@@ -62,36 +64,49 @@ if data_source == "Upload CSV File":
                 break
 
         if dt_col is None:
-            st.error("Could not find a datetime column. Please ensure your CSV has a 'datetime' column.")
+            st.error("Could not find a datetime column. Please ensure your CSV has a 'datetime' or 'date' column.")
             st.stop()
 
         df["datetime"] = pd.to_datetime(df[dt_col], dayfirst=True, errors="coerce")
         df = df.dropna(subset=["datetime"])
         df = df.sort_values("datetime").reset_index(drop=True)
 
-        if "date" not in df.columns:
-            df["date"] = df["datetime"].dt.strftime("%Y-%m-%d")
-        if "time" not in df.columns:
-            df["time"] = df["datetime"].dt.strftime("%H:%M")
-
-        # Ensure OHLCV columns exist
-        required = ["open", "high", "low", "close", "volume"]
+        # Ensure OHLC columns exist
+        required = ["open", "high", "low", "close"]
         missing = [c for c in required if c not in df.columns]
         if missing:
             st.error(f"Missing columns: {missing}. Please check your CSV.")
             st.stop()
 
-        for c in ["open", "high", "low", "close"]:
+        for c in required:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(int)
+        df = df.dropna(subset=required)
 
-        st.sidebar.success(f"Loaded {len(df):,} rows  |  {df['date'].nunique()} trading days")
+        # Auto-detect interval: check median gap between rows on first day
+        df["date"] = df["datetime"].dt.strftime("%Y-%m-%d")
+        df["time"] = df["datetime"].dt.strftime("%H:%M")
+        first_day = df[df["date"] == df["date"].iloc[0]]
+        if len(first_day) > 2:
+            gaps = first_day["datetime"].diff().dt.total_seconds().dropna()
+            median_gap = gaps.median()
+        else:
+            median_gap = 300  # assume 5-min
+
+        if median_gap < 120:
+            # 1-minute data → resample to 5-min
+            st.sidebar.info("Detected 1-min data — resampling to 5-min candles...")
+            df = resample_1min_to_5min(df)
+            st.sidebar.success(
+                f"Resampled to {len(df):,} candles  |  {df['date'].nunique()} trading days"
+            )
+        else:
+            st.sidebar.success(f"Loaded {len(df):,} rows  |  {df['date'].nunique()} trading days")
     else:
-        st.info("Upload a CSV file with 5-minute Nifty50 OHLCV data to begin backtesting, or switch to 'Generate Sample Data'.")
+        st.info("Upload a CSV file with 1-min or 5-min Nifty50 OHLC data to begin backtesting, or switch to **Generate Sample Data**.")
         st.stop()
 
 else:
-    st.sidebar.markdown("Generates realistic synthetic 5-min Nifty50 data for testing.")
+    st.sidebar.markdown("Generates realistic synthetic 5-min Nifty50 OHLC data for testing.")
     sample_start = st.sidebar.date_input("Sample start", value=pd.to_datetime("2024-01-01"))
     sample_end = st.sidebar.date_input("Sample end", value=pd.to_datetime("2024-12-31"))
     if st.sidebar.button("Generate Data"):
@@ -103,7 +118,7 @@ else:
     if "generated_df" in st.session_state:
         df = st.session_state["generated_df"]
     else:
-        st.info("Click 'Generate Data' to create sample data, or upload a real CSV.")
+        st.info("Click **Generate Data** to create sample data, or upload a real CSV.")
         st.stop()
 
 
@@ -111,7 +126,7 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.header("Strategy Settings")
 
-strategy = st.sidebar.selectbox("Strategy", ["ORB", "VWAP Pullback"])
+strategy = st.sidebar.selectbox("Strategy", ["ORB", "EMA Pullback"])
 
 available_dates = sorted(df["date"].unique())
 col_d1, col_d2 = st.sidebar.columns(2)
@@ -120,16 +135,23 @@ end_date = col_d2.selectbox("End Date", available_dates, index=len(available_dat
 
 if strategy == "ORB":
     st.sidebar.subheader("ORB Parameters")
-    volume_mult = st.sidebar.slider("Volume Multiplier (× avg)", 1.0, 3.0, 1.5, 0.1)
     risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
-    exit_time = st.sidebar.selectbox("Max Exit Time", ["11:00", "11:30", "12:00", "12:30", "13:00"], index=2)
-    strategy_kwargs = dict(volume_mult=volume_mult, risk_reward=risk_reward, exit_time=exit_time)
+    exit_time = st.sidebar.selectbox(
+        "Max Exit Time",
+        ["11:00", "11:30", "12:00", "12:30", "13:00"],
+        index=2,
+    )
+    strategy_kwargs = dict(risk_reward=risk_reward, exit_time=exit_time)
 else:
-    st.sidebar.subheader("VWAP Pullback Parameters")
-    pullback_pct = st.sidebar.slider("Pullback Threshold (%)", 0.05, 0.5, 0.1, 0.01)
+    st.sidebar.subheader("EMA Pullback Parameters")
+    ema_period = st.sidebar.slider("EMA Period", 5, 50, 20, 1)
     risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
-    exit_time = st.sidebar.selectbox("Max Exit Time", ["13:00", "13:30", "14:00", "14:30", "15:00"], index=3)
-    strategy_kwargs = dict(pullback_pct=pullback_pct, risk_reward=risk_reward, exit_time=exit_time)
+    exit_time = st.sidebar.selectbox(
+        "Max Exit Time",
+        ["13:00", "13:30", "14:00", "14:30", "15:00"],
+        index=3,
+    )
+    strategy_kwargs = dict(ema_period=ema_period, risk_reward=risk_reward, exit_time=exit_time)
 
 
 # ── Run Backtest ──────────────────────────────────────────────────────────────
@@ -283,7 +305,6 @@ st.plotly_chart(fig_dd, use_container_width=True)
 # ── Trade Log ─────────────────────────────────────────────────────────────────
 st.subheader("Trade Log")
 
-# Color P&L column
 def highlight_pnl(val):
     if val > 0:
         return "color: #2ecc71; font-weight: bold"

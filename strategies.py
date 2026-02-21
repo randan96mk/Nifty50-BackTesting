@@ -1,9 +1,10 @@
 """
 Intraday backtesting strategies for Nifty50 5-minute data.
+No volume data required — all filters are price-action based.
 
 Strategies implemented:
-  1. ORB  – Opening Range Breakout (9:15–9:30 range)
-  2. VWAP Pullback – Mean-reversion entries off VWAP
+  1. ORB          – Opening Range Breakout (9:15–9:30 range)
+  2. EMA Pullback – Trend-following entries off EMA bounce
 """
 
 import pandas as pd
@@ -14,43 +15,46 @@ import numpy as np
 # Helpers
 # ---------------------------------------------------------------------------
 
-def compute_vwap(df: pd.DataFrame) -> pd.Series:
-    """Cumulative intraday VWAP from (H+L+C)/3 * volume."""
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    cum_tp_vol = (tp * df["volume"]).cumsum()
-    cum_vol = df["volume"].cumsum()
-    return cum_tp_vol / cum_vol
-
-
 def _candle_body_above(row: pd.Series, level: float) -> bool:
+    """True if the entire candle body (open & close) is above the level."""
     return min(row["open"], row["close"]) > level
 
 
 def _candle_body_below(row: pd.Series, level: float) -> bool:
+    """True if the entire candle body (open & close) is below the level."""
     return max(row["open"], row["close"]) < level
 
 
+def _is_bullish(row: pd.Series) -> bool:
+    return row["close"] > row["open"]
+
+
+def _is_bearish(row: pd.Series) -> bool:
+    return row["close"] < row["open"]
+
+
 # ---------------------------------------------------------------------------
-# ORB Strategy
+# ORB Strategy  (no volume / no VWAP)
 # ---------------------------------------------------------------------------
 
 def run_orb_day(
     day_df: pd.DataFrame,
-    volume_mult: float = 1.5,
     risk_reward: float = 1.5,
     exit_time: str = "12:00",
 ) -> dict | None:
     """
     Run ORB strategy on a single day's 5-min data.
 
-    Steps (matching the 8-step user flow):
-      1. 09:15 candle forms (index 0–2 depending on data).
-      2. 09:20 candle closes → opening range high/low.
-         (We use the first candle: 09:15–09:20 as the opening range.)
-         Actually per spec the range is 09:15–09:30 (3 candles).
-      3. Wait for breakout candle 09:30–10:15 with filters.
-      4. SL = opposite end of range, target = 1.5× risk.
-      5. If nothing hit by exit_time, exit at market.
+    Flow:
+      1. 09:15-09:30 → first 3 candles form the Opening Range (OR High / OR Low).
+      2. 09:30-10:15 → scan for a breakout candle whose body closes
+         beyond the OR level. No volume or VWAP filter — pure price action.
+      3. Entry at close of breakout candle.
+         CE (long) if body closes above OR High.
+         PE (short) if body closes below OR Low.
+      4. SL  = opposite end of the range.
+         Target = entry ± risk_reward × risk.
+      5. If neither SL nor target hit by exit_time → exit at market.
 
     Returns trade dict or None if no entry.
     """
@@ -58,28 +62,19 @@ def run_orb_day(
     if len(day_df) < 6:
         return None
 
-    # --- Step 1-2: Identify Opening Range (09:15 – 09:30, first 3 candles) ---
+    # --- Step 1: Identify Opening Range (09:15 – 09:30) ---
     or_candles = day_df[day_df["time"] < "09:30"]
     if len(or_candles) == 0:
-        # fallback: use first 3 candles
         or_candles = day_df.iloc[:3]
 
     or_high = or_candles["high"].max()
     or_low = or_candles["low"].min()
     or_range = or_high - or_low
 
-    if or_range < 1:  # avoid degenerate ranges
+    if or_range < 1:  # skip degenerate ranges
         return None
 
-    # VWAP at end of opening range
-    vwap_vals = compute_vwap(day_df)
-    or_end_idx = or_candles.index[-1]
-    vwap_at_or = vwap_vals.iloc[or_end_idx]
-
-    # Average volume of opening range candles
-    avg_vol = or_candles["volume"].mean()
-
-    # --- Step 3: Scan for breakout (09:30 – 10:15) ---
+    # --- Step 2: Scan for breakout (09:30 – 10:15) ---
     scan_candles = day_df[(day_df["time"] >= "09:30") & (day_df["time"] <= "10:15")]
 
     entry_price = None
@@ -88,21 +83,16 @@ def run_orb_day(
     entry_idx = None
 
     for i, row in scan_candles.iterrows():
-        current_vwap = vwap_vals.iloc[i]
-
-        # Filter 1: Volume >= volume_mult × average
-        vol_ok = row["volume"] >= volume_mult * avg_vol
-
-        # Bullish breakout: body closes above OR high, VWAP below price (bullish)
-        if _candle_body_above(row, or_high) and vol_ok and row["close"] > current_vwap:
+        # Bullish breakout: candle body closes above OR high
+        if _candle_body_above(row, or_high):
             entry_price = row["close"]
             direction = "CE"
             entry_time = row["time"]
             entry_idx = i
             break
 
-        # Bearish breakout: body closes below OR low, VWAP above price (bearish)
-        if _candle_body_below(row, or_low) and vol_ok and row["close"] < current_vwap:
+        # Bearish breakout: candle body closes below OR low
+        if _candle_body_below(row, or_low):
             entry_price = row["close"]
             direction = "PE"
             entry_time = row["time"]
@@ -112,7 +102,7 @@ def run_orb_day(
     if entry_price is None:
         return None
 
-    # --- Step 4: SL and Target ---
+    # --- Step 3: SL and Target ---
     if direction == "CE":
         sl = or_low
         risk = entry_price - sl
@@ -125,14 +115,14 @@ def run_orb_day(
     if risk <= 0:
         return None
 
-    # --- Step 5: Simulate candle-by-candle ---
+    # --- Step 4: Simulate candle-by-candle ---
     exit_price = None
     exit_reason = None
     exit_time_val = None
 
     for i, row in day_df.iloc[entry_idx + 1 :].iterrows():
         if row["time"] > exit_time:
-            exit_price = row["open"]  # exit at market
+            exit_price = row["open"]
             exit_reason = "Time Exit"
             exit_time_val = row["time"]
             break
@@ -160,7 +150,6 @@ def run_orb_day(
                 exit_time_val = row["time"]
                 break
 
-    # If we never exited (data ends), close at last candle
     if exit_price is None:
         last = day_df.iloc[-1]
         exit_price = last["close"]
@@ -175,7 +164,6 @@ def run_orb_day(
         "or_high": round(or_high, 2),
         "or_low": round(or_low, 2),
         "or_range": round(or_range, 2),
-        "vwap_at_or": round(vwap_at_or, 2),
         "entry_price": round(entry_price, 2),
         "entry_time": entry_time,
         "sl": round(sl, 2),
@@ -190,33 +178,39 @@ def run_orb_day(
 
 
 # ---------------------------------------------------------------------------
-# VWAP Pullback Strategy
+# EMA Pullback Strategy  (no volume required)
 # ---------------------------------------------------------------------------
 
-def run_vwap_pullback_day(
+def _compute_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential moving average."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def run_ema_pullback_day(
     day_df: pd.DataFrame,
-    pullback_pct: float = 0.1,
+    ema_period: int = 20,
     risk_reward: float = 1.5,
     exit_time: str = "14:30",
 ) -> dict | None:
     """
-    VWAP Pullback strategy on a single day's 5-min data.
+    EMA Pullback strategy on a single day's 5-min data.
 
-    Logic:
-      - After 09:45, compute VWAP.
-      - If price touches VWAP (within pullback_pct%) and bounces with
-        a confirming candle (close beyond VWAP in trend direction):
-          Long if prior trend was up (close > open on majority of prev 3 candles)
-          Short if prior trend was down
-      - SL: Recent swing low/high (3-candle low/high before entry)
-      - Target: risk_reward × risk
-      - Exit by exit_time if neither SL nor target hit.
+    Logic (no volume needed):
+      - Compute intraday EMA on close prices.
+      - After 09:45, wait for price to pull back to EMA and bounce:
+          LONG  → prior trend bullish (2 of last 3 candles green),
+                   candle low touches/crosses EMA, candle closes above EMA.
+          SHORT → prior trend bearish (2 of last 3 candles red),
+                   candle high touches/crosses EMA, candle closes below EMA.
+      - SL: 3-candle swing low (long) or swing high (short) before entry.
+      - Target: risk_reward × risk.
+      - Exit by exit_time if neither hit.
     """
     day_df = day_df.copy().reset_index(drop=True)
     if len(day_df) < 10:
         return None
 
-    vwap_vals = compute_vwap(day_df)
+    ema = _compute_ema(day_df["close"], ema_period)
 
     scan = day_df[day_df["time"] >= "09:45"]
     entry_price = None
@@ -228,27 +222,22 @@ def run_vwap_pullback_day(
     for i, row in scan.iterrows():
         if i < 4:
             continue
-        current_vwap = vwap_vals.iloc[i]
+        current_ema = ema.iloc[i]
 
-        # Check proximity to VWAP
-        dist_pct = abs(row["close"] - current_vwap) / current_vwap * 100
-        if dist_pct > pullback_pct:
-            continue
-
-        # Determine prior trend from last 3 candles
         prev3 = day_df.iloc[i - 3 : i]
         bullish_count = (prev3["close"] > prev3["open"]).sum()
 
-        if bullish_count >= 2 and row["close"] > current_vwap:
-            # Bullish pullback bounce
+        # LONG: uptrend + price pulled back to EMA and bounced above
+        if bullish_count >= 2 and row["low"] <= current_ema and row["close"] > current_ema:
             direction = "LONG"
             entry_price = row["close"]
             entry_time = row["time"]
             entry_idx = i
             sl = prev3["low"].min()
             break
-        elif bullish_count <= 1 and row["close"] < current_vwap:
-            # Bearish pullback bounce
+
+        # SHORT: downtrend + price pulled up to EMA and rejected below
+        if bullish_count <= 1 and row["high"] >= current_ema and row["close"] < current_ema:
             direction = "SHORT"
             entry_price = row["close"]
             entry_time = row["time"]
@@ -313,7 +302,7 @@ def run_vwap_pullback_day(
     return {
         "date": day_df.iloc[0]["date"],
         "direction": direction,
-        "vwap_at_entry": round(vwap_vals.iloc[entry_idx], 2),
+        "ema_at_entry": round(ema.iloc[entry_idx], 2),
         "entry_price": round(entry_price, 2),
         "entry_time": entry_time,
         "sl": round(sl, 2),
@@ -353,8 +342,8 @@ def backtest(
     for date, day_df in grouped:
         if strategy == "ORB":
             result = run_orb_day(day_df, **kwargs)
-        elif strategy == "VWAP Pullback":
-            result = run_vwap_pullback_day(day_df, **kwargs)
+        elif strategy == "EMA Pullback":
+            result = run_ema_pullback_day(day_df, **kwargs)
         else:
             continue
         if result:
@@ -393,7 +382,7 @@ def compute_metrics(trades_df: pd.DataFrame) -> dict:
     # Drawdown
     cumulative = trades_df["pnl_points"].cumsum()
     running_max = cumulative.cummax()
-    drawdown = (cumulative - running_max)
+    drawdown = cumulative - running_max
     max_dd = drawdown.min()
 
     return {
