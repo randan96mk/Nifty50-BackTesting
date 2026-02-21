@@ -132,9 +132,11 @@ st.sidebar.header("Strategy Settings")
 strategy = st.sidebar.selectbox("Strategy", STRATEGY_LIST)
 
 available_dates = sorted(df["date"].unique())
+min_dt = pd.to_datetime(available_dates[0]).date()
+max_dt = pd.to_datetime(available_dates[-1]).date()
 col_d1, col_d2 = st.sidebar.columns(2)
-start_date = col_d1.selectbox("Start Date", available_dates, index=0)
-end_date = col_d2.selectbox("End Date", available_dates, index=len(available_dates) - 1)
+start_date = str(col_d1.date_input("Start Date", value=min_dt, min_value=min_dt, max_value=max_dt))
+end_date = str(col_d2.date_input("End Date", value=max_dt, min_value=min_dt, max_value=max_dt))
 
 # Strategy-specific parameter panels
 if strategy == "ORB":
@@ -289,13 +291,21 @@ trade_dates = sorted(trades_df["date"].unique().tolist())
 if len(trade_dates) == 0:
     st.info("No trades to display on chart.")
 else:
-    # Date selector for candlestick chart
-    selected_chart_date = st.selectbox(
+    # Date picker for candlestick chart
+    trade_dates_dt = [pd.to_datetime(d).date() for d in trade_dates]
+    selected_chart_dt = st.date_input(
         "Select trading day to view",
-        trade_dates,
-        index=0,
-        key="chart_date_select",
+        value=trade_dates_dt[0],
+        min_value=trade_dates_dt[0],
+        max_value=trade_dates_dt[-1],
+        key="chart_date_input",
     )
+    # Snap to nearest trade date if user picks a non-trade day
+    selected_chart_date = str(selected_chart_dt)
+    if selected_chart_date not in trade_dates:
+        # Find closest trade date
+        closest = min(trade_dates, key=lambda d: abs(pd.to_datetime(d).date() - selected_chart_dt))
+        selected_chart_date = closest
 
     # Get candle data for the selected date
     day_candles = chart_df[chart_df["date"] == selected_chart_date].copy()
@@ -500,16 +510,16 @@ else:
 
         # Navigation buttons for previous/next trade
         nav1, nav2, nav3 = st.columns([1, 2, 1])
-        current_idx = trade_dates.index(selected_chart_date)
+        current_idx = trade_dates.index(selected_chart_date) if selected_chart_date in trade_dates else 0
         with nav1:
             if current_idx > 0:
                 if st.button("< Previous Trade"):
-                    st.session_state["chart_date_select"] = trade_dates[current_idx - 1]
+                    st.session_state["chart_date_input"] = pd.to_datetime(trade_dates[current_idx - 1]).date()
                     st.rerun()
         with nav3:
             if current_idx < len(trade_dates) - 1:
                 if st.button("Next Trade >"):
-                    st.session_state["chart_date_select"] = trade_dates[current_idx + 1]
+                    st.session_state["chart_date_input"] = pd.to_datetime(trade_dates[current_idx + 1]).date()
                     st.rerun()
 
 
