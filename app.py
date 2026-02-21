@@ -1,8 +1,11 @@
 """
 Nifty50 Intraday Backtesting Dashboard
 =======================================
-Streamlit UI for backtesting ORB and EMA Pullback strategies
-on Nifty50 5-minute candle data (no volume required).
+Streamlit UI for backtesting 6 intraday strategies on Nifty50 5-minute
+candle data (no volume required).
+
+Strategies: ORB, EMA Pullback, PDH/PDL Breakout, MACD Crossover,
+            Supertrend, Inside Bar Breakout.
 
 Supports uploading 1-minute CSV data (auto-resampled to 5-min).
 
@@ -15,7 +18,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from strategies import backtest, compute_metrics
+from strategies import backtest, compute_metrics, STRATEGY_LIST
 from data_generator import generate_intraday_data, resample_1min_to_5min
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -126,13 +129,14 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.header("Strategy Settings")
 
-strategy = st.sidebar.selectbox("Strategy", ["ORB", "EMA Pullback"])
+strategy = st.sidebar.selectbox("Strategy", STRATEGY_LIST)
 
 available_dates = sorted(df["date"].unique())
 col_d1, col_d2 = st.sidebar.columns(2)
 start_date = col_d1.selectbox("Start Date", available_dates, index=0)
 end_date = col_d2.selectbox("End Date", available_dates, index=len(available_dates) - 1)
 
+# Strategy-specific parameter panels
 if strategy == "ORB":
     st.sidebar.subheader("ORB Parameters")
     risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
@@ -142,7 +146,8 @@ if strategy == "ORB":
         index=2,
     )
     strategy_kwargs = dict(risk_reward=risk_reward, exit_time=exit_time)
-else:
+
+elif strategy == "EMA Pullback":
     st.sidebar.subheader("EMA Pullback Parameters")
     ema_period = st.sidebar.slider("EMA Period", 5, 50, 20, 1)
     risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
@@ -152,6 +157,59 @@ else:
         index=3,
     )
     strategy_kwargs = dict(ema_period=ema_period, risk_reward=risk_reward, exit_time=exit_time)
+
+elif strategy == "PDH/PDL Breakout":
+    st.sidebar.subheader("PDH/PDL Parameters")
+    buffer_points = st.sidebar.slider("Buffer Points", 0.0, 20.0, 5.0, 1.0)
+    risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
+    exit_time = st.sidebar.selectbox(
+        "Max Exit Time",
+        ["12:00", "12:30", "13:00", "13:30", "14:00", "14:30"],
+        index=4,
+    )
+    strategy_kwargs = dict(buffer_points=buffer_points, risk_reward=risk_reward, exit_time=exit_time)
+
+elif strategy == "MACD Crossover":
+    st.sidebar.subheader("MACD Parameters")
+    fast_period = st.sidebar.slider("Fast EMA Period", 5, 20, 12, 1)
+    slow_period = st.sidebar.slider("Slow EMA Period", 15, 40, 26, 1)
+    signal_period = st.sidebar.slider("Signal Period", 3, 15, 9, 1)
+    risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
+    exit_time = st.sidebar.selectbox(
+        "Max Exit Time",
+        ["13:00", "13:30", "14:00", "14:30", "15:00"],
+        index=3,
+    )
+    strategy_kwargs = dict(
+        fast_period=fast_period, slow_period=slow_period,
+        signal_period=signal_period, risk_reward=risk_reward, exit_time=exit_time,
+    )
+
+elif strategy == "Supertrend":
+    st.sidebar.subheader("Supertrend Parameters")
+    atr_period = st.sidebar.slider("ATR Period", 5, 20, 10, 1)
+    multiplier = st.sidebar.slider("Multiplier", 1.0, 5.0, 3.0, 0.5)
+    risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
+    exit_time = st.sidebar.selectbox(
+        "Max Exit Time",
+        ["13:00", "13:30", "14:00", "14:30", "15:00"],
+        index=3,
+    )
+    strategy_kwargs = dict(
+        atr_period=atr_period, multiplier=multiplier,
+        risk_reward=risk_reward, exit_time=exit_time,
+    )
+
+elif strategy == "Inside Bar":
+    st.sidebar.subheader("Inside Bar Parameters")
+    min_mother_range = st.sidebar.slider("Min Mother Bar Range (pts)", 5.0, 50.0, 10.0, 1.0)
+    risk_reward = st.sidebar.slider("Risk:Reward Ratio", 1.0, 3.0, 1.5, 0.1)
+    exit_time = st.sidebar.selectbox(
+        "Max Exit Time",
+        ["12:00", "12:30", "13:00", "13:30", "14:00", "14:30"],
+        index=4,
+    )
+    strategy_kwargs = dict(min_mother_range=min_mother_range, risk_reward=risk_reward, exit_time=exit_time)
 
 
 # ── Run Backtest ──────────────────────────────────────────────────────────────
@@ -167,6 +225,9 @@ if run_btn:
     )
     st.session_state["trades_df"] = trades_df
     st.session_state["strategy_name"] = strategy
+    # Store full filtered data for charting
+    filtered = df[(df["date"] >= start_date) & (df["date"] <= end_date)].copy()
+    st.session_state["chart_df"] = filtered
 
 if "trades_df" not in st.session_state:
     st.info("Configure parameters in the sidebar and click **Run Backtest**.")
@@ -174,6 +235,7 @@ if "trades_df" not in st.session_state:
 
 trades_df = st.session_state["trades_df"]
 strategy_name = st.session_state.get("strategy_name", strategy)
+chart_df = st.session_state.get("chart_df", df)
 
 
 # ── Results ───────────────────────────────────────────────────────────────────
@@ -217,6 +279,238 @@ with m3:
     st.write(f"- Target Hits: {metrics['target_hits']}")
     st.write(f"- SL Hits: {metrics['sl_hits']}")
     st.write(f"- Time/EOD Exits: {metrics['time_exits']}")
+
+
+# ── Candlestick Chart with Buy/Sell Signals ──────────────────────────────────
+st.subheader("Candlestick Chart with Trade Signals")
+
+trade_dates = sorted(trades_df["date"].unique().tolist())
+
+if len(trade_dates) == 0:
+    st.info("No trades to display on chart.")
+else:
+    # Date selector for candlestick chart
+    selected_chart_date = st.selectbox(
+        "Select trading day to view",
+        trade_dates,
+        index=0,
+        key="chart_date_select",
+    )
+
+    # Get candle data for the selected date
+    day_candles = chart_df[chart_df["date"] == selected_chart_date].copy()
+    day_trade = trades_df[trades_df["date"] == selected_chart_date]
+
+    if not day_candles.empty:
+        # Build datetime for x-axis
+        day_candles["dt"] = pd.to_datetime(
+            day_candles["date"] + " " + day_candles["time"]
+        )
+
+        fig_candle = make_subplots(
+            rows=1, cols=1,
+            shared_xaxes=True,
+        )
+
+        # Candlestick trace
+        fig_candle.add_trace(
+            go.Candlestick(
+                x=day_candles["dt"],
+                open=day_candles["open"],
+                high=day_candles["high"],
+                low=day_candles["low"],
+                close=day_candles["close"],
+                increasing_line_color="#2ecc71",
+                decreasing_line_color="#e74c3c",
+                increasing_fillcolor="#2ecc71",
+                decreasing_fillcolor="#e74c3c",
+                name="Price",
+            ),
+            row=1, col=1,
+        )
+
+        # Plot trade signals if trade exists for this day
+        if not day_trade.empty:
+            trade = day_trade.iloc[0]
+            entry_dt = pd.to_datetime(f"{selected_chart_date} {trade['entry_time']}")
+            exit_dt = pd.to_datetime(f"{selected_chart_date} {trade['exit_time']}")
+            is_long = trade["direction"] in ("CE", "LONG")
+
+            # BUY signal marker
+            buy_color = "#2ecc71" if is_long else "#e74c3c"
+            buy_symbol = "triangle-up" if is_long else "triangle-down"
+            buy_label = "BUY (Long)" if is_long else "SELL (Short)"
+            fig_candle.add_trace(
+                go.Scatter(
+                    x=[entry_dt],
+                    y=[trade["entry_price"]],
+                    mode="markers+text",
+                    marker=dict(symbol=buy_symbol, size=16, color=buy_color, line=dict(width=2, color="white")),
+                    text=[buy_label],
+                    textposition="top center" if is_long else "bottom center",
+                    textfont=dict(size=11, color=buy_color, family="Arial Black"),
+                    name="Entry",
+                    showlegend=True,
+                )
+            )
+
+            # EXIT signal marker
+            exit_color = "#e74c3c" if is_long else "#2ecc71"
+            exit_symbol = "triangle-down" if is_long else "triangle-up"
+            exit_label = f"EXIT ({trade['exit_reason']})"
+            fig_candle.add_trace(
+                go.Scatter(
+                    x=[exit_dt],
+                    y=[trade["exit_price"]],
+                    mode="markers+text",
+                    marker=dict(symbol=exit_symbol, size=16, color=exit_color, line=dict(width=2, color="white")),
+                    text=[exit_label],
+                    textposition="bottom center" if is_long else "top center",
+                    textfont=dict(size=11, color=exit_color, family="Arial Black"),
+                    name="Exit",
+                    showlegend=True,
+                )
+            )
+
+            # SL line
+            fig_candle.add_hline(
+                y=trade["sl"],
+                line_dash="dash",
+                line_color="#e74c3c",
+                line_width=1,
+                annotation_text=f"SL: {trade['sl']:.1f}",
+                annotation_position="right",
+                annotation_font_color="#e74c3c",
+            )
+
+            # Target line
+            fig_candle.add_hline(
+                y=trade["target"],
+                line_dash="dash",
+                line_color="#2ecc71",
+                line_width=1,
+                annotation_text=f"Target: {trade['target']:.1f}",
+                annotation_position="right",
+                annotation_font_color="#2ecc71",
+            )
+
+            # Entry price line
+            fig_candle.add_hline(
+                y=trade["entry_price"],
+                line_dash="dot",
+                line_color="#3498db",
+                line_width=1,
+                annotation_text=f"Entry: {trade['entry_price']:.1f}",
+                annotation_position="left",
+                annotation_font_color="#3498db",
+            )
+
+            # P&L annotation
+            pnl_color = "#2ecc71" if trade["pnl_points"] > 0 else "#e74c3c"
+            pnl_text = f"P&L: {trade['pnl_points']:+.1f} pts  |  {trade['exit_reason']}"
+
+        # Strategy-specific overlays
+        if strategy_name == "ORB" and not day_trade.empty:
+            trade = day_trade.iloc[0]
+            if "or_high" in trade and "or_low" in trade:
+                or_start = pd.to_datetime(f"{selected_chart_date} 09:15")
+                or_end = pd.to_datetime(f"{selected_chart_date} 09:30")
+                # OR High shading
+                fig_candle.add_shape(
+                    type="rect",
+                    x0=or_start, x1=day_candles["dt"].iloc[-1],
+                    y0=trade["or_low"], y1=trade["or_high"],
+                    fillcolor="rgba(52, 152, 219, 0.1)",
+                    line=dict(width=0),
+                )
+                fig_candle.add_hline(
+                    y=trade["or_high"], line_dash="dot", line_color="#f39c12", line_width=1,
+                    annotation_text=f"OR High: {trade['or_high']:.1f}",
+                    annotation_position="left", annotation_font_color="#f39c12",
+                )
+                fig_candle.add_hline(
+                    y=trade["or_low"], line_dash="dot", line_color="#f39c12", line_width=1,
+                    annotation_text=f"OR Low: {trade['or_low']:.1f}",
+                    annotation_position="left", annotation_font_color="#f39c12",
+                )
+
+        elif strategy_name == "PDH/PDL Breakout" and not day_trade.empty:
+            trade = day_trade.iloc[0]
+            if "pdh" in trade and "pdl" in trade:
+                fig_candle.add_hline(
+                    y=trade["pdh"], line_dash="dashdot", line_color="#9b59b6", line_width=1,
+                    annotation_text=f"PDH: {trade['pdh']:.1f}",
+                    annotation_position="left", annotation_font_color="#9b59b6",
+                )
+                fig_candle.add_hline(
+                    y=trade["pdl"], line_dash="dashdot", line_color="#9b59b6", line_width=1,
+                    annotation_text=f"PDL: {trade['pdl']:.1f}",
+                    annotation_position="left", annotation_font_color="#9b59b6",
+                )
+
+        elif strategy_name == "Inside Bar" and not day_trade.empty:
+            trade = day_trade.iloc[0]
+            if "mother_high" in trade and "mother_low" in trade:
+                fig_candle.add_hline(
+                    y=trade["mother_high"], line_dash="dashdot", line_color="#f39c12", line_width=1,
+                    annotation_text=f"Mother High: {trade['mother_high']:.1f}",
+                    annotation_position="left", annotation_font_color="#f39c12",
+                )
+                fig_candle.add_hline(
+                    y=trade["mother_low"], line_dash="dashdot", line_color="#f39c12", line_width=1,
+                    annotation_text=f"Mother Low: {trade['mother_low']:.1f}",
+                    annotation_position="left", annotation_font_color="#f39c12",
+                )
+
+        # Trade info box
+        if not day_trade.empty:
+            trade = day_trade.iloc[0]
+            pnl_color = "#2ecc71" if trade["pnl_points"] > 0 else "#e74c3c"
+            fig_candle.add_annotation(
+                x=0.5, y=1.12,
+                xref="paper", yref="paper",
+                text=(
+                    f"<b>{trade['direction']}</b> | "
+                    f"Entry: {trade['entry_price']:.1f} @ {trade['entry_time']} | "
+                    f"Exit: {trade['exit_price']:.1f} @ {trade['exit_time']} | "
+                    f"<span style='color:{pnl_color}'><b>P&L: {trade['pnl_points']:+.1f} pts</b></span> | "
+                    f"{trade['exit_reason']}"
+                ),
+                showarrow=False,
+                font=dict(size=13),
+                align="center",
+            )
+
+        fig_candle.update_layout(
+            title=f"{strategy_name} — {selected_chart_date}",
+            yaxis_title="Price",
+            xaxis_title="Time",
+            height=550,
+            margin=dict(l=50, r=50, t=80, b=40),
+            xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            plot_bgcolor="#1a1a2e",
+            paper_bgcolor="#16213e",
+            font=dict(color="#e0e0e0"),
+            xaxis=dict(gridcolor="#2a2a4a"),
+            yaxis=dict(gridcolor="#2a2a4a"),
+        )
+
+        st.plotly_chart(fig_candle, use_container_width=True)
+
+        # Navigation buttons for previous/next trade
+        nav1, nav2, nav3 = st.columns([1, 2, 1])
+        current_idx = trade_dates.index(selected_chart_date)
+        with nav1:
+            if current_idx > 0:
+                if st.button("< Previous Trade"):
+                    st.session_state["chart_date_select"] = trade_dates[current_idx - 1]
+                    st.rerun()
+        with nav3:
+            if current_idx < len(trade_dates) - 1:
+                if st.button("Next Trade >"):
+                    st.session_state["chart_date_select"] = trade_dates[current_idx + 1]
+                    st.rerun()
 
 
 # ── Equity Curve ──────────────────────────────────────────────────────────────
