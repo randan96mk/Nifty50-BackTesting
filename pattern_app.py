@@ -50,24 +50,37 @@ df = None
 
 if data_source == "Upload CSV File":
     st.sidebar.markdown(
-        "**Expected CSV columns:** `date, open, high, low, close`\n\n"
-        "Daily candles. Volume is optional (not used)."
+        "**Expected CSV columns:** `date/datetime, open, high, low, close`\n\n"
+        "Daily **or** intraday candles (auto-resampled to daily).\n"
+        "Volume column is optional (not used)."
     )
-    uploaded = st.sidebar.file_uploader("Upload Daily OHLC CSV", type=["csv"])
+    uploaded = st.sidebar.file_uploader("Upload OHLC CSV", type=["csv"])
     if uploaded is not None:
         df = pd.read_csv(uploaded)
         df.columns = [c.strip().lower() for c in df.columns]
 
         dt_col = None
-        for candidate in ["date", "datetime", "timestamp"]:
+        for candidate in ["datetime", "date_time", "date", "timestamp", "time"]:
             if candidate in df.columns:
                 dt_col = candidate
                 break
         if dt_col is None:
-            st.error("CSV must have a 'date' column.")
+            st.error("CSV must have a 'date' or 'datetime' column.")
             st.stop()
 
-        df["date"] = pd.to_datetime(df[dt_col], dayfirst=True).dt.strftime("%Y-%m-%d")
+        # Robust datetime parsing: try ISO first, then mixed formats
+        raw_dt = df[dt_col].astype(str)
+        try:
+            parsed = pd.to_datetime(raw_dt, format="ISO8601")
+        except Exception:
+            try:
+                parsed = pd.to_datetime(raw_dt, format="mixed", dayfirst=False)
+            except Exception:
+                parsed = pd.to_datetime(raw_dt, dayfirst=True, errors="coerce")
+
+        df["_datetime"] = parsed
+        df = df.dropna(subset=["_datetime"]).sort_values("_datetime").reset_index(drop=True)
+
         required = ["open", "high", "low", "close"]
         missing = [c for c in required if c not in df.columns]
         if missing:
@@ -75,8 +88,30 @@ if data_source == "Upload CSV File":
             st.stop()
         for c in required:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=required).reset_index(drop=True)
-        st.sidebar.success(f"Loaded {len(df):,} daily bars")
+        df = df.dropna(subset=required)
+
+        # Auto-detect if data is intraday (multiple rows per calendar day)
+        df["date"] = df["_datetime"].dt.strftime("%Y-%m-%d")
+        rows_per_day = df.groupby("date").size().median()
+
+        if rows_per_day > 1:
+            # Intraday data → resample to daily OHLC
+            st.sidebar.info(
+                f"Detected intraday data (~{int(rows_per_day)} bars/day) "
+                f"— resampling to daily candles..."
+            )
+            daily = (
+                df.groupby("date")
+                .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+                .reset_index()
+            )
+            df = daily
+
+        df = df.reset_index(drop=True)
+        st.sidebar.success(
+            f"Loaded {len(df):,} daily bars  "
+            f"({df['date'].iloc[0]} → {df['date'].iloc[-1]})"
+        )
     else:
         st.info("Upload a daily OHLC CSV or switch to **Generate Sample Data**.")
         st.stop()
