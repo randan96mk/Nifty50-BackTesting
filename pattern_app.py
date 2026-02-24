@@ -166,12 +166,29 @@ st.sidebar.markdown("---")
 st.sidebar.header("Pattern Parameters")
 st.sidebar.caption(f"Tuned for {timeframe_label} intraday candles")
 
+with st.sidebar.expander("ATR & Noise Filter", expanded=True):
+    use_atr = st.checkbox("Use ATR-adaptive thresholds",
+                          value=True, key="use_atr",
+                          help="Adapts tolerance, SL, and min height to "
+                               "current volatility via ATR")
+    atr_period = st.slider("ATR period (bars)", 7, 30, 14, 1, key="atr_period",
+                           help="Lookback for Average True Range calculation")
+    sl_atr_mult = st.slider("SL distance (ATR multiples)", 0.5, 3.0, 1.5, 0.5,
+                            key="sl_atr",
+                            help="Stop loss = resistance/support +/- N x ATR")
+    zigzag_thresh = st.slider("ZigZag noise threshold (ATR mult)", 0.5, 3.0, 1.0, 0.5,
+                              key="zz_thresh",
+                              help="Min swing size to count as a pivot. "
+                                   "Higher = fewer but cleaner peaks/troughs")
+
 with st.sidebar.expander("Triple Top / Bottom", expanded=False):
     tt_peak_order = st.slider("Peak/Trough sensitivity (bars)", 3, 15, 5, 1,
                               key="tt_order",
-                              help="Higher = fewer, more significant peaks")
+                              help="Fallback when ATR mode is off. "
+                                   "Higher = fewer, more significant peaks")
     tt_tolerance = st.slider("Price tolerance (%)", 0.1, 2.0, 0.3, 0.1,
-                             key="tt_tol")
+                             key="tt_tol",
+                             help="Fallback when ATR mode is off")
     tt_min_spacing = st.slider("Min spacing (bars)", 3, 20, 8, 1,
                                key="tt_sp")
     tt_max_pattern = st.slider("Max pattern span (bars)", 20, 120, 60, 5,
@@ -198,6 +215,16 @@ with st.sidebar.expander("Flags / Rectangles", expanded=False):
 max_hold = st.sidebar.slider("Max hold period (bars)", 5, 60, 20, 5,
                               help="Max bars to hold a position before time exit")
 
+with st.sidebar.expander("Entry Time Window", expanded=False):
+    st.caption("Filter out entries outside the best intraday window")
+    earliest_entry = st.text_input("Earliest entry (HH:MM)", value="09:30",
+                                    key="earliest_entry",
+                                    help="No entries before this time (IST)")
+    latest_entry = st.text_input("Latest entry (HH:MM)", value="14:00",
+                                  key="latest_entry",
+                                  help="No entries after this time — "
+                                       "not enough runway for target")
+
 
 # ── Run Backtest ─────────────────────────────────────────────────────────────
 run_btn = st.sidebar.button("Run Pattern Backtest", type="primary",
@@ -219,6 +246,12 @@ if run_btn:
             pole_lookback=fl_pole_lookback, pole_min_pct=fl_pole_min,
             consol_min_bars=fl_consol_min, consol_max_bars=fl_consol_max),
         max_hold_bars=max_hold,
+        use_atr=use_atr,
+        atr_period=atr_period,
+        sl_atr_mult=sl_atr_mult,
+        zigzag_threshold=zigzag_thresh,
+        earliest_entry=earliest_entry,
+        latest_entry=latest_entry,
     )
     st.session_state["pat_trades"] = trades_df
     st.session_state["pat_metrics"] = per_pattern

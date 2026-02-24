@@ -15,7 +15,111 @@ from typing import List, Dict, Tuple
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Local extrema detection
+# ATR (Average True Range) — adaptive volatility measurement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_atr(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """
+    Compute ATR using Wilder's smoothing.
+
+    Returns an array of the same length as inputs.  The first *period* values
+    are NaN.  ATR adapts to the current volatility regime and is used
+    throughout the pattern detector for:
+      - Noise-adaptive tolerance when comparing peak/trough levels
+      - Dynamic stop-loss placement (ATR multiples)
+      - Minimum pattern height thresholds
+    """
+    n = len(closes)
+    tr = np.empty(n)
+    tr[0] = highs[0] - lows[0]
+    for i in range(1, n):
+        tr[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+
+    atr = np.full(n, np.nan)
+    if n < period:
+        return atr
+
+    atr[period - 1] = tr[:period].mean()
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+
+    return atr
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZigZag noise filter — identifies significant turning points
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def zigzag_pivots(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    atr: np.ndarray,
+    atr_threshold: float = 1.0,
+) -> Tuple[List[int], List[int]]:
+    """
+    ZigZag-based pivot detection that filters out noise below *atr_threshold*
+    multiples of ATR.
+
+    A swing is only confirmed when price reverses by at least
+    atr_threshold * ATR from the current extreme.  This produces fewer
+    but more significant peaks and troughs than the fixed-order method,
+    especially on noisy intraday data.
+
+    Returns (peak_indices, trough_indices).
+    """
+    n = len(highs)
+    peaks: List[int] = []
+    troughs: List[int] = []
+
+    # Find the first valid ATR index
+    start = 0
+    for i in range(n):
+        if not np.isnan(atr[i]):
+            start = i
+            break
+
+    if start >= n - 1:
+        return peaks, troughs
+
+    # Initialise: direction = +1 means looking for peak, -1 for trough
+    direction = 1 if highs[start] >= lows[start] else -1
+    last_high_idx = start
+    last_low_idx = start
+
+    for i in range(start + 1, n):
+        threshold = atr[i] * atr_threshold if not np.isnan(atr[i]) else 0
+
+        if direction == 1:  # trending up, looking for peak
+            if highs[i] > highs[last_high_idx]:
+                last_high_idx = i  # extend the swing
+            elif highs[last_high_idx] - lows[i] >= threshold:
+                # Confirmed peak
+                peaks.append(last_high_idx)
+                direction = -1
+                last_low_idx = i
+        else:  # trending down, looking for trough
+            if lows[i] < lows[last_low_idx]:
+                last_low_idx = i  # extend the swing
+            elif highs[i] - lows[last_low_idx] >= threshold:
+                # Confirmed trough
+                troughs.append(last_low_idx)
+                direction = 1
+                last_high_idx = i
+
+    return peaks, troughs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Local extrema detection (original fixed-order method, kept as fallback)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def find_peaks(series: np.ndarray, order: int = 5) -> List[int]:
@@ -58,33 +162,38 @@ def detect_triple_tops(
     max_pattern_bars: int = 60,
     max_breakout_wait: int = 10,
     min_pattern_height_pct: float = 0.3,
+    use_atr: bool = True,
+    atr_period: int = 14,
+    atr_tolerance_mult: float = 1.5,
+    sl_atr_mult: float = 1.5,
+    zigzag_threshold: float = 1.0,
 ) -> List[Dict]:
     """
     Detect Triple Top (bearish reversal) patterns on intraday candles.
 
-    Quantitative rules
-    ------------------
-    1. Three local peaks whose *high* prices are within *tolerance_pct* %
-       of their average.
-    2. Consecutive peaks separated by >= *min_spacing* bars; total span
-       <= *max_pattern_bars*.
-    3. Neckline (support) = lowest low between the first and third peak.
-    4. Pattern height (avg peak - neckline) >= *min_pattern_height_pct* %
-       of the neckline price.
-    5. Breakout confirmed when close < neckline within *max_breakout_wait*
-       bars after the third peak.
+    When *use_atr* is True (default), thresholds adapt to current volatility:
+    - Peak tolerance = atr_tolerance_mult * ATR (instead of fixed %)
+    - SL = resistance + sl_atr_mult * ATR (instead of fixed 0.3%)
+    - Peaks found via ZigZag noise filter (instead of fixed-order)
 
     Trade setup
     -----------
     * Entry  : close of the breakout bar
-    * SL     : 0.3 % above the average peak price (resistance)
+    * SL     : resistance + sl_atr_mult * ATR
     * Target : neckline - pattern_height (measured move)
     """
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
 
-    peaks = find_peaks(highs, order=peak_order)
+    if use_atr:
+        atr = compute_atr(highs, lows, closes, period=atr_period)
+        zz_peaks, _ = zigzag_pivots(highs, lows, atr, atr_threshold=zigzag_threshold)
+        peaks = zz_peaks if len(zz_peaks) >= 3 else find_peaks(highs, order=peak_order)
+    else:
+        atr = None
+        peaks = find_peaks(highs, order=peak_order)
+
     patterns: List[Dict] = []
     used: set = set()
 
@@ -112,10 +221,15 @@ def detect_triple_tops(
                 h1, h2, h3 = highs[p1], highs[p2], highs[p3]
                 avg_h = (h1 + h2 + h3) / 3.0
 
-                # Similar price levels
-                if any(abs(h - avg_h) / avg_h * 100 > tolerance_pct
-                       for h in (h1, h2, h3)):
-                    continue
+                # Adaptive tolerance: ATR-based or percentage-based
+                if use_atr and atr is not None and not np.isnan(atr[p3]):
+                    tol = atr[p3] * atr_tolerance_mult
+                    if any(abs(h - avg_h) > tol for h in (h1, h2, h3)):
+                        continue
+                else:
+                    if any(abs(h - avg_h) / avg_h * 100 > tolerance_pct
+                           for h in (h1, h2, h3)):
+                        continue
 
                 # Neckline
                 seg = lows[p1:p3 + 1]
@@ -124,15 +238,25 @@ def detect_triple_tops(
 
                 # Minimum height
                 pattern_height = avg_h - neckline
-                if pattern_height / neckline * 100 < min_pattern_height_pct:
-                    continue
+                if use_atr and atr is not None and not np.isnan(atr[p3]):
+                    if pattern_height < atr[p3] * 1.5:
+                        continue
+                else:
+                    if pattern_height / neckline * 100 < min_pattern_height_pct:
+                        continue
 
                 # Breakout scan
                 end = min(p3 + max_breakout_wait + 1, len(df))
                 for b in range(p3 + 1, end):
                     if closes[b] < neckline:
                         entry = closes[b]
-                        sl = avg_h * 1.003   # tighter SL for intraday
+
+                        # ATR-based SL or fixed
+                        if use_atr and atr is not None and not np.isnan(atr[b]):
+                            sl = avg_h + atr[b] * sl_atr_mult
+                        else:
+                            sl = avg_h * 1.003
+
                         target = neckline - pattern_height
                         risk = sl - entry
                         reward = entry - target
@@ -181,24 +305,38 @@ def detect_triple_bottoms(
     max_pattern_bars: int = 60,
     max_breakout_wait: int = 10,
     min_pattern_height_pct: float = 0.3,
+    use_atr: bool = True,
+    atr_period: int = 14,
+    atr_tolerance_mult: float = 1.5,
+    sl_atr_mult: float = 1.5,
+    zigzag_threshold: float = 1.0,
 ) -> List[Dict]:
     """
     Detect Triple Bottom (bullish reversal) patterns on intraday candles.
 
-    Same logic as Triple Top, but inverted: three troughs at similar lows,
-    resistance neckline above, and breakout above the neckline.
+    When *use_atr* is True (default), thresholds adapt to current volatility:
+    - Trough tolerance = atr_tolerance_mult * ATR
+    - SL = support - sl_atr_mult * ATR
+    - Troughs found via ZigZag noise filter
 
     Trade setup
     -----------
     * Entry  : close of the breakout bar
-    * SL     : 0.3 % below the average trough price (support)
+    * SL     : support - sl_atr_mult * ATR
     * Target : neckline + pattern_height (measured move)
     """
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
 
-    troughs = find_troughs(lows, order=trough_order)
+    if use_atr:
+        atr = compute_atr(highs, lows, closes, period=atr_period)
+        _, zz_troughs = zigzag_pivots(highs, lows, atr, atr_threshold=zigzag_threshold)
+        troughs = zz_troughs if len(zz_troughs) >= 3 else find_troughs(lows, order=trough_order)
+    else:
+        atr = None
+        troughs = find_troughs(lows, order=trough_order)
+
     patterns: List[Dict] = []
     used: set = set()
 
@@ -226,9 +364,15 @@ def detect_triple_bottoms(
                 l1, l2, l3 = lows[t1], lows[t2], lows[t3]
                 avg_l = (l1 + l2 + l3) / 3.0
 
-                if any(abs(l - avg_l) / avg_l * 100 > tolerance_pct
-                       for l in (l1, l2, l3)):
-                    continue
+                # Adaptive tolerance
+                if use_atr and atr is not None and not np.isnan(atr[t3]):
+                    tol = atr[t3] * atr_tolerance_mult
+                    if any(abs(l - avg_l) > tol for l in (l1, l2, l3)):
+                        continue
+                else:
+                    if any(abs(l - avg_l) / avg_l * 100 > tolerance_pct
+                           for l in (l1, l2, l3)):
+                        continue
 
                 # Neckline (resistance) = highest high between t1 and t3
                 seg = highs[t1:t3 + 1]
@@ -236,14 +380,24 @@ def detect_triple_bottoms(
                 neckline_idx = int(t1 + seg.argmax())
 
                 pattern_height = neckline - avg_l
-                if pattern_height / avg_l * 100 < min_pattern_height_pct:
-                    continue
+                if use_atr and atr is not None and not np.isnan(atr[t3]):
+                    if pattern_height < atr[t3] * 1.5:
+                        continue
+                else:
+                    if pattern_height / avg_l * 100 < min_pattern_height_pct:
+                        continue
 
                 end = min(t3 + max_breakout_wait + 1, len(df))
                 for b in range(t3 + 1, end):
                     if closes[b] > neckline:
                         entry = closes[b]
-                        sl = avg_l * 0.997   # tighter SL for intraday
+
+                        # ATR-based SL
+                        if use_atr and atr is not None and not np.isnan(atr[b]):
+                            sl = avg_l - atr[b] * sl_atr_mult
+                        else:
+                            sl = avg_l * 0.997
+
                         target = neckline + pattern_height
                         risk = entry - sl
                         reward = target - entry
@@ -825,17 +979,35 @@ def run_all_patterns(
     triangle_params: Dict | None = None,
     flag_rect_params: Dict | None = None,
     max_hold_bars: int = 20,
+    use_atr: bool = True,
+    atr_period: int = 14,
+    sl_atr_mult: float = 1.5,
+    zigzag_threshold: float = 1.0,
+    earliest_entry: str = "09:30",
+    latest_entry: str = "14:00",
 ) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
     """
     Convenience function: detect all pattern types, backtest, and return
     a combined trades DataFrame plus per-pattern-type metrics.
+
+    ATR-related params are forwarded to all detectors.
+    Time-of-day filter removes entries before *earliest_entry* or after
+    *latest_entry* (IST, HH:MM) — entries too late in the day don't have
+    sufficient runway for the pattern target to be reached.
     """
+    atr_shared = dict(
+        use_atr=use_atr,
+        atr_period=atr_period,
+        sl_atr_mult=sl_atr_mult,
+        zigzag_threshold=zigzag_threshold,
+    )
+
     all_patterns = []
 
-    tt_params = triple_top_params or {}
+    tt_params = {**atr_shared, **(triple_top_params or {})}
     all_patterns.extend(detect_triple_tops(df, **tt_params))
 
-    tb_params = triple_bottom_params or {}
+    tb_params = {**atr_shared, **(triple_bottom_params or {})}
     all_patterns.extend(detect_triple_bottoms(df, **tb_params))
 
     tri_params = triangle_params or {}
@@ -843,6 +1015,21 @@ def run_all_patterns(
 
     fr_params = flag_rect_params or {}
     all_patterns.extend(detect_flags_rectangles(df, **fr_params))
+
+    if not all_patterns:
+        return pd.DataFrame(), {}
+
+    # Time-of-day filter: skip entries outside the trading window
+    has_time = "time" in df.columns
+    if has_time and earliest_entry and latest_entry:
+        times = df["time"].values
+        filtered = []
+        for pat in all_patterns:
+            b_idx = pat["breakout_idx"]
+            entry_time = times[b_idx]
+            if earliest_entry <= entry_time <= latest_entry:
+                filtered.append(pat)
+        all_patterns = filtered
 
     if not all_patterns:
         return pd.DataFrame(), {}
