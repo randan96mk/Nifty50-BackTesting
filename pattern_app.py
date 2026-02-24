@@ -161,6 +161,70 @@ else:
         st.stop()
 
 
+# ── Sidebar: Backtest Date Range ─────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.header("Backtest Date Range")
+
+# Parse dates available in the loaded data
+_all_dates = sorted(df["date"].unique())
+_data_start = pd.to_datetime(_all_dates[0]).date()
+_data_end = pd.to_datetime(_all_dates[-1]).date()
+
+from datetime import timedelta
+from dateutil.relativedelta import relativedelta
+
+_range_preset = st.sidebar.selectbox(
+    "Quick range",
+    ["Last 1 Year", "Last 2 Years", "Last 3 Years", "YTD", "Full Data", "Custom"],
+    index=4,
+    key="range_preset",
+)
+
+if _range_preset == "Last 1 Year":
+    _preset_start = _data_end - relativedelta(years=1)
+    _preset_end = _data_end
+elif _range_preset == "Last 2 Years":
+    _preset_start = _data_end - relativedelta(years=2)
+    _preset_end = _data_end
+elif _range_preset == "Last 3 Years":
+    _preset_start = _data_end - relativedelta(years=3)
+    _preset_end = _data_end
+elif _range_preset == "YTD":
+    _preset_start = pd.to_datetime(f"{_data_end.year}-01-01").date()
+    _preset_end = _data_end
+elif _range_preset == "Full Data":
+    _preset_start = _data_start
+    _preset_end = _data_end
+else:  # Custom
+    _preset_start = _data_start
+    _preset_end = _data_end
+
+_col_ds, _col_de = st.sidebar.columns(2)
+bt_start = _col_ds.date_input(
+    "From", value=max(_preset_start, _data_start),
+    min_value=_data_start, max_value=_data_end, key="bt_start",
+)
+bt_end = _col_de.date_input(
+    "To", value=min(_preset_end, _data_end),
+    min_value=_data_start, max_value=_data_end, key="bt_end",
+)
+
+# Apply the date filter
+_bt_start_str = str(bt_start)
+_bt_end_str = str(bt_end)
+df = df[(df["date"] >= _bt_start_str) & (df["date"] <= _bt_end_str)].reset_index(drop=True)
+
+if df.empty:
+    st.warning("No data in the selected date range. Adjust the range.")
+    st.stop()
+
+_filtered_days = df["date"].nunique()
+st.sidebar.caption(
+    f"Backtesting: {df['date'].iloc[0]} to {df['date'].iloc[-1]}  \n"
+    f"{len(df):,} candles across {_filtered_days} trading days"
+)
+
+
 # ── Sidebar: Pattern Parameters ─────────────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.header("Pattern Parameters")
