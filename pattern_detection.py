@@ -1,8 +1,8 @@
 """
-Chart Pattern Detection and Backtesting for Nifty 50 Daily Data.
+Chart Pattern Detection and Backtesting for Nifty 50 Intraday Data.
 
 Detects and backtests three categories of breakout patterns using OHLC
-price data only (no volume required):
+price data only (no volume required), tuned for 3-min / 5-min candles:
 
 1. Triple Tops and Triple Bottoms  – reversal patterns
 2. Triangle Breakouts              – ascending, descending, symmetrical
@@ -15,7 +15,111 @@ from typing import List, Dict, Tuple
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Local extrema detection
+# ATR (Average True Range) — adaptive volatility measurement
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_atr(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """
+    Compute ATR using Wilder's smoothing.
+
+    Returns an array of the same length as inputs.  The first *period* values
+    are NaN.  ATR adapts to the current volatility regime and is used
+    throughout the pattern detector for:
+      - Noise-adaptive tolerance when comparing peak/trough levels
+      - Dynamic stop-loss placement (ATR multiples)
+      - Minimum pattern height thresholds
+    """
+    n = len(closes)
+    tr = np.empty(n)
+    tr[0] = highs[0] - lows[0]
+    for i in range(1, n):
+        tr[i] = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+
+    atr = np.full(n, np.nan)
+    if n < period:
+        return atr
+
+    atr[period - 1] = tr[:period].mean()
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+
+    return atr
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZigZag noise filter — identifies significant turning points
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def zigzag_pivots(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    atr: np.ndarray,
+    atr_threshold: float = 1.0,
+) -> Tuple[List[int], List[int]]:
+    """
+    ZigZag-based pivot detection that filters out noise below *atr_threshold*
+    multiples of ATR.
+
+    A swing is only confirmed when price reverses by at least
+    atr_threshold * ATR from the current extreme.  This produces fewer
+    but more significant peaks and troughs than the fixed-order method,
+    especially on noisy intraday data.
+
+    Returns (peak_indices, trough_indices).
+    """
+    n = len(highs)
+    peaks: List[int] = []
+    troughs: List[int] = []
+
+    # Find the first valid ATR index
+    start = 0
+    for i in range(n):
+        if not np.isnan(atr[i]):
+            start = i
+            break
+
+    if start >= n - 1:
+        return peaks, troughs
+
+    # Initialise: direction = +1 means looking for peak, -1 for trough
+    direction = 1 if highs[start] >= lows[start] else -1
+    last_high_idx = start
+    last_low_idx = start
+
+    for i in range(start + 1, n):
+        threshold = atr[i] * atr_threshold if not np.isnan(atr[i]) else 0
+
+        if direction == 1:  # trending up, looking for peak
+            if highs[i] > highs[last_high_idx]:
+                last_high_idx = i  # extend the swing
+            elif highs[last_high_idx] - lows[i] >= threshold:
+                # Confirmed peak
+                peaks.append(last_high_idx)
+                direction = -1
+                last_low_idx = i
+        else:  # trending down, looking for trough
+            if lows[i] < lows[last_low_idx]:
+                last_low_idx = i  # extend the swing
+            elif highs[i] - lows[last_low_idx] >= threshold:
+                # Confirmed trough
+                troughs.append(last_low_idx)
+                direction = 1
+                last_high_idx = i
+
+    return peaks, troughs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Local extrema detection (original fixed-order method, kept as fallback)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def find_peaks(series: np.ndarray, order: int = 5) -> List[int]:
@@ -52,39 +156,44 @@ def find_troughs(series: np.ndarray, order: int = 5) -> List[int]:
 
 def detect_triple_tops(
     df: pd.DataFrame,
-    peak_order: int = 10,
-    tolerance_pct: float = 1.5,
-    min_spacing: int = 15,
-    max_pattern_bars: int = 120,
-    max_breakout_wait: int = 20,
-    min_pattern_height_pct: float = 2.0,
+    peak_order: int = 5,
+    tolerance_pct: float = 0.3,
+    min_spacing: int = 8,
+    max_pattern_bars: int = 60,
+    max_breakout_wait: int = 10,
+    min_pattern_height_pct: float = 0.3,
+    use_atr: bool = True,
+    atr_period: int = 14,
+    atr_tolerance_mult: float = 1.5,
+    sl_atr_mult: float = 1.5,
+    zigzag_threshold: float = 1.0,
 ) -> List[Dict]:
     """
-    Detect Triple Top (bearish reversal) patterns.
+    Detect Triple Top (bearish reversal) patterns on intraday candles.
 
-    Quantitative rules
-    ------------------
-    1. Three local peaks whose *high* prices are within *tolerance_pct* %
-       of their average.
-    2. Consecutive peaks separated by >= *min_spacing* bars; total span
-       <= *max_pattern_bars*.
-    3. Neckline (support) = lowest low between the first and third peak.
-    4. Pattern height (avg peak − neckline) >= *min_pattern_height_pct* %
-       of the neckline price.
-    5. Breakout confirmed when close < neckline within *max_breakout_wait*
-       bars after the third peak.
+    When *use_atr* is True (default), thresholds adapt to current volatility:
+    - Peak tolerance = atr_tolerance_mult * ATR (instead of fixed %)
+    - SL = resistance + sl_atr_mult * ATR (instead of fixed 0.3%)
+    - Peaks found via ZigZag noise filter (instead of fixed-order)
 
     Trade setup
     -----------
     * Entry  : close of the breakout bar
-    * SL     : 0.5 % above the average peak price (resistance)
-    * Target : neckline − pattern_height (measured move)
+    * SL     : resistance + sl_atr_mult * ATR
+    * Target : neckline - pattern_height (measured move)
     """
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
 
-    peaks = find_peaks(highs, order=peak_order)
+    if use_atr:
+        atr = compute_atr(highs, lows, closes, period=atr_period)
+        zz_peaks, _ = zigzag_pivots(highs, lows, atr, atr_threshold=zigzag_threshold)
+        peaks = zz_peaks if len(zz_peaks) >= 3 else find_peaks(highs, order=peak_order)
+    else:
+        atr = None
+        peaks = find_peaks(highs, order=peak_order)
+
     patterns: List[Dict] = []
     used: set = set()
 
@@ -112,10 +221,15 @@ def detect_triple_tops(
                 h1, h2, h3 = highs[p1], highs[p2], highs[p3]
                 avg_h = (h1 + h2 + h3) / 3.0
 
-                # Similar price levels
-                if any(abs(h - avg_h) / avg_h * 100 > tolerance_pct
-                       for h in (h1, h2, h3)):
-                    continue
+                # Adaptive tolerance: ATR-based or percentage-based
+                if use_atr and atr is not None and not np.isnan(atr[p3]):
+                    tol = atr[p3] * atr_tolerance_mult
+                    if any(abs(h - avg_h) > tol for h in (h1, h2, h3)):
+                        continue
+                else:
+                    if any(abs(h - avg_h) / avg_h * 100 > tolerance_pct
+                           for h in (h1, h2, h3)):
+                        continue
 
                 # Neckline
                 seg = lows[p1:p3 + 1]
@@ -124,18 +238,32 @@ def detect_triple_tops(
 
                 # Minimum height
                 pattern_height = avg_h - neckline
-                if pattern_height / neckline * 100 < min_pattern_height_pct:
-                    continue
+                if use_atr and atr is not None and not np.isnan(atr[p3]):
+                    if pattern_height < atr[p3] * 1.5:
+                        continue
+                else:
+                    if pattern_height / neckline * 100 < min_pattern_height_pct:
+                        continue
 
                 # Breakout scan
                 end = min(p3 + max_breakout_wait + 1, len(df))
                 for b in range(p3 + 1, end):
                     if closes[b] < neckline:
                         entry = closes[b]
-                        sl = avg_h * 1.005
+
+                        # ATR-based SL or fixed
+                        if use_atr and atr is not None and not np.isnan(atr[b]):
+                            sl = avg_h + atr[b] * sl_atr_mult
+                        else:
+                            sl = avg_h * 1.003
+
                         target = neckline - pattern_height
                         risk = sl - entry
                         reward = entry - target
+
+                        dt_label = df.iloc[b].get("dt_label", df.iloc[b].get("date", ""))
+                        pat_start_dt = df.iloc[p1].get("dt_label", df.iloc[p1].get("date", ""))
+                        pat_end_dt = df.iloc[p3].get("dt_label", df.iloc[p3].get("date", ""))
 
                         patterns.append({
                             "pattern": "Triple Top",
@@ -154,9 +282,9 @@ def detect_triple_tops(
                             "risk": round(risk, 2),
                             "reward": round(reward, 2),
                             "planned_rr": round(reward / risk, 2) if risk > 0 else 0,
-                            "entry_date": df.iloc[b]["date"],
-                            "pattern_start_date": df.iloc[p1]["date"],
-                            "pattern_end_date": df.iloc[p3]["date"],
+                            "entry_dt": dt_label,
+                            "pattern_start_dt": pat_start_dt,
+                            "pattern_end_dt": pat_end_dt,
                         })
                         used.update([p1, p2, p3])
                         break
@@ -171,30 +299,44 @@ def detect_triple_tops(
 
 def detect_triple_bottoms(
     df: pd.DataFrame,
-    trough_order: int = 10,
-    tolerance_pct: float = 1.5,
-    min_spacing: int = 15,
-    max_pattern_bars: int = 120,
-    max_breakout_wait: int = 20,
-    min_pattern_height_pct: float = 2.0,
+    trough_order: int = 5,
+    tolerance_pct: float = 0.3,
+    min_spacing: int = 8,
+    max_pattern_bars: int = 60,
+    max_breakout_wait: int = 10,
+    min_pattern_height_pct: float = 0.3,
+    use_atr: bool = True,
+    atr_period: int = 14,
+    atr_tolerance_mult: float = 1.5,
+    sl_atr_mult: float = 1.5,
+    zigzag_threshold: float = 1.0,
 ) -> List[Dict]:
     """
-    Detect Triple Bottom (bullish reversal) patterns.
+    Detect Triple Bottom (bullish reversal) patterns on intraday candles.
 
-    Same logic as Triple Top, but inverted: three troughs at similar lows,
-    resistance neckline above, and breakout above the neckline.
+    When *use_atr* is True (default), thresholds adapt to current volatility:
+    - Trough tolerance = atr_tolerance_mult * ATR
+    - SL = support - sl_atr_mult * ATR
+    - Troughs found via ZigZag noise filter
 
     Trade setup
     -----------
     * Entry  : close of the breakout bar
-    * SL     : 0.5 % below the average trough price (support)
+    * SL     : support - sl_atr_mult * ATR
     * Target : neckline + pattern_height (measured move)
     """
     highs = df["high"].values
     lows = df["low"].values
     closes = df["close"].values
 
-    troughs = find_troughs(lows, order=trough_order)
+    if use_atr:
+        atr = compute_atr(highs, lows, closes, period=atr_period)
+        _, zz_troughs = zigzag_pivots(highs, lows, atr, atr_threshold=zigzag_threshold)
+        troughs = zz_troughs if len(zz_troughs) >= 3 else find_troughs(lows, order=trough_order)
+    else:
+        atr = None
+        troughs = find_troughs(lows, order=trough_order)
+
     patterns: List[Dict] = []
     used: set = set()
 
@@ -222,9 +364,15 @@ def detect_triple_bottoms(
                 l1, l2, l3 = lows[t1], lows[t2], lows[t3]
                 avg_l = (l1 + l2 + l3) / 3.0
 
-                if any(abs(l - avg_l) / avg_l * 100 > tolerance_pct
-                       for l in (l1, l2, l3)):
-                    continue
+                # Adaptive tolerance
+                if use_atr and atr is not None and not np.isnan(atr[t3]):
+                    tol = atr[t3] * atr_tolerance_mult
+                    if any(abs(l - avg_l) > tol for l in (l1, l2, l3)):
+                        continue
+                else:
+                    if any(abs(l - avg_l) / avg_l * 100 > tolerance_pct
+                           for l in (l1, l2, l3)):
+                        continue
 
                 # Neckline (resistance) = highest high between t1 and t3
                 seg = highs[t1:t3 + 1]
@@ -232,17 +380,31 @@ def detect_triple_bottoms(
                 neckline_idx = int(t1 + seg.argmax())
 
                 pattern_height = neckline - avg_l
-                if pattern_height / avg_l * 100 < min_pattern_height_pct:
-                    continue
+                if use_atr and atr is not None and not np.isnan(atr[t3]):
+                    if pattern_height < atr[t3] * 1.5:
+                        continue
+                else:
+                    if pattern_height / avg_l * 100 < min_pattern_height_pct:
+                        continue
 
                 end = min(t3 + max_breakout_wait + 1, len(df))
                 for b in range(t3 + 1, end):
                     if closes[b] > neckline:
                         entry = closes[b]
-                        sl = avg_l * 0.995
+
+                        # ATR-based SL
+                        if use_atr and atr is not None and not np.isnan(atr[b]):
+                            sl = avg_l - atr[b] * sl_atr_mult
+                        else:
+                            sl = avg_l * 0.997
+
                         target = neckline + pattern_height
                         risk = entry - sl
                         reward = target - entry
+
+                        dt_label = df.iloc[b].get("dt_label", df.iloc[b].get("date", ""))
+                        pat_start_dt = df.iloc[t1].get("dt_label", df.iloc[t1].get("date", ""))
+                        pat_end_dt = df.iloc[t3].get("dt_label", df.iloc[t3].get("date", ""))
 
                         patterns.append({
                             "pattern": "Triple Bottom",
@@ -261,9 +423,9 @@ def detect_triple_bottoms(
                             "risk": round(risk, 2),
                             "reward": round(reward, 2),
                             "planned_rr": round(reward / risk, 2) if risk > 0 else 0,
-                            "entry_date": df.iloc[b]["date"],
-                            "pattern_start_date": df.iloc[t1]["date"],
-                            "pattern_end_date": df.iloc[t3]["date"],
+                            "entry_dt": dt_label,
+                            "pattern_start_dt": pat_start_dt,
+                            "pattern_end_dt": pat_end_dt,
                         })
                         used.update([t1, t2, t3])
                         break
@@ -292,36 +454,37 @@ def _classify_triangle(
     Slopes are in price-per-bar.  We normalise to a per-window percentage
     change so the threshold is scale-independent.
 
-    * Ascending   : flat upper (~0 %) + rising lower (> +1 %)
-    * Descending  : falling upper (< −1 %) + flat lower (~0 %)
-    * Symmetrical : falling upper (< −0.5 %) + rising lower (> +0.5 %)
+    * Ascending   : flat upper (~0 %) + rising lower (> +0.5 %)
+    * Descending  : falling upper (< -0.5 %) + flat lower (~0 %)
+    * Symmetrical : falling upper (< -0.3 %) + rising lower (> +0.3 %)
     """
     upper_pct = upper_slope * window_size / avg_price * 100
     lower_pct = lower_slope * window_size / avg_price * 100
 
-    flat = 1.0  # threshold %
+    flat = 0.5  # threshold % — tighter for intraday
 
     if abs(upper_pct) <= flat and lower_pct > flat:
         return "Ascending Triangle"
     if upper_pct < -flat and abs(lower_pct) <= flat:
         return "Descending Triangle"
-    if upper_pct < -0.5 and lower_pct > 0.5:
+    if upper_pct < -0.3 and lower_pct > 0.3:
         return "Symmetrical Triangle"
     return None
 
 
 def detect_triangles(
     df: pd.DataFrame,
-    peak_order: int = 5,
-    min_window: int = 25,
-    max_window: int = 80,
-    window_step: int = 5,
+    peak_order: int = 3,
+    min_window: int = 15,
+    max_window: int = 50,
+    window_step: int = 3,
     min_touches: int = 2,
-    max_breakout_wait: int = 15,
-    min_height_pct: float = 1.5,
+    max_breakout_wait: int = 8,
+    min_height_pct: float = 0.2,
 ) -> List[Dict]:
     """
-    Detect triangle consolidation patterns (ascending, descending, symmetrical).
+    Detect triangle consolidation patterns (ascending, descending, symmetrical)
+    on intraday candles.
 
     Quantitative rules
     ------------------
@@ -335,9 +498,9 @@ def detect_triangles(
 
     Trade setup
     -----------
-    * Ascending   → expect bullish breakout above upper trendline
-    * Descending  → expect bearish breakout below lower trendline
-    * Symmetrical → trade whichever side breaks
+    * Ascending   -> expect bullish breakout above upper trendline
+    * Descending  -> expect bearish breakout below lower trendline
+    * Symmetrical -> trade whichever side breaks
     * SL: opposite trendline at breakout bar
     * Target: triangle height projected from breakout level
     """
@@ -425,6 +588,10 @@ def detect_triangles(
                 if risk <= 0:
                     continue
 
+                dt_label = df.iloc[b].get("dt_label", df.iloc[b].get("date", ""))
+                pat_start_dt = df.iloc[start].get("dt_label", df.iloc[start].get("date", ""))
+                pat_end_dt = df.iloc[end].get("dt_label", df.iloc[end].get("date", ""))
+
                 patterns.append({
                     "pattern": tri_type,
                     "direction": direction,
@@ -442,9 +609,9 @@ def detect_triangles(
                     "risk": round(risk, 2),
                     "reward": round(reward, 2),
                     "planned_rr": round(reward / risk, 2) if risk > 0 else 0,
-                    "entry_date": df.iloc[b]["date"],
-                    "pattern_start_date": df.iloc[start]["date"],
-                    "pattern_end_date": df.iloc[end]["date"],
+                    "entry_dt": dt_label,
+                    "pattern_start_dt": pat_start_dt,
+                    "pattern_end_dt": pat_end_dt,
                 })
                 used_windows.append((start, end))
                 break
@@ -458,16 +625,16 @@ def detect_triangles(
 
 def detect_flags_rectangles(
     df: pd.DataFrame,
-    pole_lookback: int = 15,
-    pole_min_pct: float = 4.0,
-    consol_min_bars: int = 8,
-    consol_max_bars: int = 30,
+    pole_lookback: int = 8,
+    pole_min_pct: float = 0.8,
+    consol_min_bars: int = 5,
+    consol_max_bars: int = 20,
     consol_max_range_ratio: float = 0.50,
     flag_slope_threshold: float = 0.3,
-    max_breakout_wait: int = 10,
+    max_breakout_wait: int = 5,
 ) -> List[Dict]:
     """
-    Detect flag and rectangle breakout-buildup patterns.
+    Detect flag and rectangle breakout-buildup patterns on intraday candles.
 
     Quantitative rules
     ------------------
@@ -475,10 +642,10 @@ def detect_flags_rectangles(
        *pole_lookback* bars.
     2. **Consolidation**: after the pole, price forms a tight range for
        *consol_min_bars* to *consol_max_bars* bars whose range is
-       <= *consol_max_range_ratio* × pole height.
+       <= *consol_max_range_ratio* x pole height.
     3. **Classification**:
        - *Flag*: consolidation has a slight counter-trend slope
-         (slope × bars / price > *flag_slope_threshold* % against pole dir).
+         (slope x bars / price > *flag_slope_threshold* % against pole dir).
        - *Rectangle*: consolidation slope is near zero.
     4. **Breakout**: close beyond the consolidation boundary in the pole
        direction within *max_breakout_wait* bars.
@@ -540,7 +707,7 @@ def detect_flags_rectangles(
             elif pole_dir == "BEAR" and slope_pct > flag_slope_threshold:
                 ptype = "Bear Flag"
             elif abs(slope_pct) <= flag_slope_threshold:
-                ptype = "Rectangle" if pole_dir == "BULL" else "Rectangle"
+                ptype = "Rectangle"
             else:
                 continue
 
@@ -584,6 +751,10 @@ def detect_flags_rectangles(
             if risk <= 0:
                 continue
 
+            dt_label = df.iloc[b].get("dt_label", df.iloc[b].get("date", ""))
+            pat_start_dt = df.iloc[pole_start].get("dt_label", df.iloc[pole_start].get("date", ""))
+            pat_end_dt = df.iloc[c_end].get("dt_label", df.iloc[c_end].get("date", ""))
+
             patterns.append({
                 "pattern": best_consol["ptype"],
                 "direction": direction,
@@ -602,9 +773,9 @@ def detect_flags_rectangles(
                 "risk": round(risk, 2),
                 "reward": round(reward, 2),
                 "planned_rr": round(reward / risk, 2) if risk > 0 else 0,
-                "entry_date": df.iloc[b]["date"],
-                "pattern_start_date": df.iloc[pole_start]["date"],
-                "pattern_end_date": df.iloc[c_end]["date"],
+                "entry_dt": dt_label,
+                "pattern_start_dt": pat_start_dt,
+                "pattern_end_dt": pat_end_dt,
             })
             used_ranges.append((pole_start, c_end))
             break
@@ -619,24 +790,29 @@ def detect_flags_rectangles(
 def backtest_patterns(
     df: pd.DataFrame,
     patterns: List[Dict],
-    max_hold_days: int = 30,
+    max_hold_bars: int = 20,
 ) -> pd.DataFrame:
     """
-    Simulate trades for each detected pattern.
+    Simulate trades for each detected pattern on intraday candles.
 
     For each pattern, enters at the breakout bar close and exits when one of
     the following occurs (checked bar-by-bar):
       1. Target price hit
       2. Stop-loss hit
-      3. Max holding period reached → exit at close
+      3. Max holding period reached -> exit at close
+      4. End of trading day -> exit at close (no overnight holding)
 
     Returns a DataFrame with one row per trade, including realised P&L,
-    exit reason, and holding period.
+    exit reason, and holding period in bars.
     """
     closes = df["close"].values
     highs = df["high"].values
     lows = df["low"].values
     n = len(df)
+
+    # Build date array for intraday session tracking
+    has_date = "date" in df.columns
+    dates = df["date"].values if has_date else None
 
     trades = []
 
@@ -647,11 +823,22 @@ def backtest_patterns(
         sl = pat["sl"]
         target = pat["target"]
 
+        entry_date = dates[b_idx] if dates is not None else None
+
         exit_price = None
         exit_reason = None
         exit_idx = None
 
-        for bar in range(b_idx + 1, min(b_idx + max_hold_days + 1, n)):
+        for bar in range(b_idx + 1, min(b_idx + max_hold_bars + 1, n)):
+            # End of day check — exit before overnight gap
+            if dates is not None and dates[bar] != entry_date:
+                exit_idx = bar - 1  # last bar of entry day
+                if exit_idx <= b_idx:
+                    exit_idx = bar
+                exit_price = closes[min(exit_idx, n - 1)]
+                exit_reason = "EOD Exit"
+                break
+
             if direction == "LONG":
                 if lows[bar] <= sl:
                     exit_price = sl
@@ -677,7 +864,7 @@ def backtest_patterns(
 
         # Time exit
         if exit_price is None:
-            exit_idx = min(b_idx + max_hold_days, n - 1)
+            exit_idx = min(b_idx + max_hold_bars, n - 1)
             exit_price = closes[exit_idx]
             exit_reason = "Time Exit"
 
@@ -698,30 +885,32 @@ def backtest_patterns(
             mae_prices = highs[b_idx + 1:exit_idx + 1] if exit_idx > b_idx else [entry]
             mae = max(mae_prices) - entry if len(mae_prices) > 0 else 0
 
+        exit_dt = df.iloc[exit_idx].get("dt_label", df.iloc[exit_idx].get("date", ""))
+
         trades.append({
             "pattern": pat["pattern"],
             "direction": direction,
-            "entry_date": pat["entry_date"],
+            "entry_dt": pat["entry_dt"],
             "entry_price": round(entry, 2),
             "sl": round(sl, 2),
             "target": round(target, 2),
             "exit_price": round(exit_price, 2),
-            "exit_date": df.iloc[exit_idx]["date"],
+            "exit_dt": exit_dt,
             "exit_reason": exit_reason,
-            "hold_days": exit_idx - b_idx,
+            "hold_bars": exit_idx - b_idx,
             "pnl_points": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
             "risk_points": round(risk, 2),
             "actual_rr": round(actual_rr, 2),
             "max_adverse_excursion": round(mae, 2),
             "planned_rr": pat.get("planned_rr", 0),
-            "pattern_start_date": pat.get("pattern_start_date", ""),
-            "pattern_end_date": pat.get("pattern_end_date", ""),
+            "pattern_start_dt": pat.get("pattern_start_dt", ""),
+            "pattern_end_dt": pat.get("pattern_end_dt", ""),
             "breakout_idx": pat["breakout_idx"],
             # Carry forward pattern-specific keys for charting
             **{k: v for k, v in pat.items() if k not in [
                 "pattern", "direction", "entry_price", "sl", "target",
-                "entry_date", "pattern_start_date", "pattern_end_date",
+                "entry_dt", "pattern_start_dt", "pattern_end_dt",
                 "risk", "reward", "planned_rr", "breakout_idx",
             ]},
         })
@@ -739,7 +928,7 @@ def compute_pattern_metrics(trades_df: pd.DataFrame) -> Dict:
 
     Returns: total_trades, winners, losers, win_rate, avg_return_pct,
     total_pnl, max_win, max_loss, profit_factor, max_drawdown,
-    avg_risk_reward, avg_hold_days, target_hits, sl_hits, time_exits.
+    avg_risk_reward, avg_hold_bars, target_hits, sl_hits, time_exits.
     """
     if trades_df.empty:
         return {k: 0 for k in [
@@ -747,7 +936,8 @@ def compute_pattern_metrics(trades_df: pd.DataFrame) -> Dict:
             "avg_return_pct", "total_pnl", "max_win", "max_loss",
             "avg_winner_pct", "avg_loser_pct",
             "profit_factor", "max_drawdown", "avg_risk_reward",
-            "avg_hold_days", "target_hits", "sl_hits", "time_exits",
+            "avg_hold_bars", "target_hits", "sl_hits", "time_exits",
+            "eod_exits",
         ]}
 
     winners = trades_df[trades_df["pnl_points"] > 0]
@@ -774,10 +964,11 @@ def compute_pattern_metrics(trades_df: pd.DataFrame) -> Dict:
         "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else float("inf"),
         "max_drawdown": round(dd.min(), 2),
         "avg_risk_reward": round(trades_df["actual_rr"].mean(), 2),
-        "avg_hold_days": round(trades_df["hold_days"].mean(), 1),
+        "avg_hold_bars": round(trades_df["hold_bars"].mean(), 1),
         "target_hits": int((trades_df["exit_reason"] == "Target Hit").sum()),
         "sl_hits": int((trades_df["exit_reason"] == "SL Hit").sum()),
         "time_exits": int((trades_df["exit_reason"] == "Time Exit").sum()),
+        "eod_exits": int((trades_df["exit_reason"] == "EOD Exit").sum()),
     }
 
 
@@ -787,18 +978,36 @@ def run_all_patterns(
     triple_bottom_params: Dict | None = None,
     triangle_params: Dict | None = None,
     flag_rect_params: Dict | None = None,
-    max_hold_days: int = 30,
+    max_hold_bars: int = 20,
+    use_atr: bool = True,
+    atr_period: int = 14,
+    sl_atr_mult: float = 1.5,
+    zigzag_threshold: float = 1.0,
+    earliest_entry: str = "09:30",
+    latest_entry: str = "14:00",
 ) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
     """
     Convenience function: detect all pattern types, backtest, and return
     a combined trades DataFrame plus per-pattern-type metrics.
+
+    ATR-related params are forwarded to all detectors.
+    Time-of-day filter removes entries before *earliest_entry* or after
+    *latest_entry* (IST, HH:MM) — entries too late in the day don't have
+    sufficient runway for the pattern target to be reached.
     """
+    atr_shared = dict(
+        use_atr=use_atr,
+        atr_period=atr_period,
+        sl_atr_mult=sl_atr_mult,
+        zigzag_threshold=zigzag_threshold,
+    )
+
     all_patterns = []
 
-    tt_params = triple_top_params or {}
+    tt_params = {**atr_shared, **(triple_top_params or {})}
     all_patterns.extend(detect_triple_tops(df, **tt_params))
 
-    tb_params = triple_bottom_params or {}
+    tb_params = {**atr_shared, **(triple_bottom_params or {})}
     all_patterns.extend(detect_triple_bottoms(df, **tb_params))
 
     tri_params = triangle_params or {}
@@ -810,7 +1019,22 @@ def run_all_patterns(
     if not all_patterns:
         return pd.DataFrame(), {}
 
-    trades_df = backtest_patterns(df, all_patterns, max_hold_days=max_hold_days)
+    # Time-of-day filter: skip entries outside the trading window
+    has_time = "time" in df.columns
+    if has_time and earliest_entry and latest_entry:
+        times = df["time"].values
+        filtered = []
+        for pat in all_patterns:
+            b_idx = pat["breakout_idx"]
+            entry_time = times[b_idx]
+            if earliest_entry <= entry_time <= latest_entry:
+                filtered.append(pat)
+        all_patterns = filtered
+
+    if not all_patterns:
+        return pd.DataFrame(), {}
+
+    trades_df = backtest_patterns(df, all_patterns, max_hold_bars=max_hold_bars)
 
     # Per-pattern metrics
     per_pattern = {}
