@@ -122,3 +122,92 @@ def generate_intraday_data(
 
     df = pd.DataFrame(rows)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Daily OHLC data generator (for chart pattern backtesting)
+# ---------------------------------------------------------------------------
+
+def generate_daily_data(
+    start_date: str = "2015-01-01",
+    end_date: str = "2024-12-31",
+    base_price: float = 8282.0,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Generate synthetic daily OHLC data resembling Nifty 50 price history.
+
+    Uses a regime-switching model with distinct market phases (bull, bear,
+    sideways, crash, recovery) to produce data that naturally contains
+    chart patterns such as triple tops/bottoms, triangles, and flags.
+
+    Returns a DataFrame with columns: date, open, high, low, close
+    """
+    rng = np.random.RandomState(seed)
+    dates = pd.bdate_range(start_date, end_date)
+
+    # Regime sequence: (approx_days, daily_drift, daily_volatility)
+    regimes = [
+        (120, 0.00040, 0.0100),   # 2015 H1: mild bull
+        (60, -0.00020, 0.0120),   # 2015 mid: pullback
+        (70,  0.00030, 0.0090),   # 2015 H2: recovery
+        (80, -0.00030, 0.0130),   # 2016 early: correction
+        (100, 0.00050, 0.0080),   # 2016-17: bull run
+        (120, 0.00060, 0.0090),   # 2017: strong bull
+        (60,  0.00040, 0.0110),   # 2018 H1: topping
+        (40,  0.00000, 0.0080),   # consolidation
+        (60, -0.00040, 0.0140),   # 2018 H2: correction
+        (80,  0.00030, 0.0100),   # 2019 H1: recovery
+        (40,  0.00000, 0.0070),   # 2019 mid: range-bound
+        (60,  0.00020, 0.0090),   # 2019 H2: mild up
+        (40, -0.00020, 0.0120),   # 2020 Q1: pre-crash
+        (25, -0.00350, 0.0350),   # 2020 Mar: COVID crash
+        (60,  0.00150, 0.0200),   # 2020 Q2-Q3: recovery
+        (100, 0.00060, 0.0110),   # 2020 H2 - 2021 H1: bull
+        (80,  0.00050, 0.0100),   # 2021 H2: continuation
+        (40,  0.00000, 0.0080),   # 2022 Q1: topping
+        (60, -0.00030, 0.0140),   # 2022 H1: correction
+        (50,  0.00000, 0.0090),   # 2022 H2: range-bound
+        (80,  0.00040, 0.0100),   # 2023 H1: bull
+        (60,  0.00020, 0.0080),   # 2023 H2: consolidation
+        (80,  0.00050, 0.0110),   # 2024 H1: bull
+        (60,  0.00030, 0.0090),   # 2024 H2: mild bull
+    ]
+
+    price = base_price
+    rows = []
+    regime_idx = 0
+    bars_in_regime = 0
+
+    for date in dates:
+        if regime_idx < len(regimes):
+            drift, vol = regimes[regime_idx][1], regimes[regime_idx][2]
+        else:
+            drift, vol = regimes[-1][1], regimes[-1][2]
+
+        daily_return = rng.normal(drift, vol)
+        close = price * (1 + daily_return)
+
+        # Realistic OHLC: wicks extend beyond the body
+        body = abs(close - price)
+        upper_wick = body * rng.uniform(0.1, 1.2)
+        lower_wick = body * rng.uniform(0.1, 1.2)
+        high = max(price, close) + upper_wick
+        low = min(price, close) - lower_wick
+
+        rows.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "open": round(price, 2),
+            "high": round(high, 2),
+            "low": round(low, 2),
+            "close": round(close, 2),
+        })
+
+        price = close
+        bars_in_regime += 1
+
+        if regime_idx < len(regimes) and bars_in_regime >= regimes[regime_idx][0]:
+            regime_idx += 1
+            bars_in_regime = 0
+
+    return pd.DataFrame(rows)
