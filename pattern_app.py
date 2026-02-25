@@ -225,6 +225,48 @@ st.sidebar.caption(
 )
 
 
+# ── Sidebar: Pattern Selection ────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.header("Pattern Selection")
+st.sidebar.caption("Choose which patterns to detect and backtest")
+
+_sel_col1, _sel_col2 = st.sidebar.columns(2)
+with _sel_col1:
+    pat_triple_top = st.checkbox("Triple Top", value=True, key="pat_tt")
+    pat_triple_bot = st.checkbox("Triple Bottom", value=True, key="pat_tb")
+    pat_asc_tri = st.checkbox("Ascending Triangle", value=True, key="pat_at")
+with _sel_col2:
+    pat_desc_tri = st.checkbox("Descending Triangle", value=True, key="pat_dt")
+    pat_sym_tri = st.checkbox("Symmetrical Triangle", value=True, key="pat_st")
+    pat_rectangle = st.checkbox("Rectangle", value=True, key="pat_rect")
+
+_sel_col3, _sel_col4 = st.sidebar.columns(2)
+with _sel_col3:
+    pat_bull_flag = st.checkbox("Bull Flag", value=True, key="pat_bf")
+with _sel_col4:
+    pat_bear_flag = st.checkbox("Bear Flag", value=True, key="pat_brf")
+
+enabled_patterns = set()
+if pat_triple_top:
+    enabled_patterns.add("Triple Top")
+if pat_triple_bot:
+    enabled_patterns.add("Triple Bottom")
+if pat_asc_tri:
+    enabled_patterns.add("Ascending Triangle")
+if pat_desc_tri:
+    enabled_patterns.add("Descending Triangle")
+if pat_sym_tri:
+    enabled_patterns.add("Symmetrical Triangle")
+if pat_rectangle:
+    enabled_patterns.add("Rectangle")
+if pat_bull_flag:
+    enabled_patterns.add("Bull Flag")
+if pat_bear_flag:
+    enabled_patterns.add("Bear Flag")
+
+if not enabled_patterns:
+    st.sidebar.warning("Select at least one pattern.")
+
 # ── Sidebar: Pattern Parameters ─────────────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.header("Pattern Parameters")
@@ -295,6 +337,9 @@ run_btn = st.sidebar.button("Run Pattern Backtest", type="primary",
                             use_container_width=True)
 
 if run_btn:
+    if not enabled_patterns:
+        st.error("Select at least one pattern to backtest.")
+        st.stop()
     trades_df, per_pattern = run_all_patterns(
         df,
         triple_top_params=dict(
@@ -316,6 +361,7 @@ if run_btn:
         zigzag_threshold=zigzag_thresh,
         earliest_entry=earliest_entry,
         latest_entry=latest_entry,
+        enabled_patterns=enabled_patterns,
     )
     st.session_state["pat_trades"] = trades_df
     st.session_state["pat_metrics"] = per_pattern

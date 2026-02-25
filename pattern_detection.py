@@ -985,16 +985,28 @@ def run_all_patterns(
     zigzag_threshold: float = 1.0,
     earliest_entry: str = "09:30",
     latest_entry: str = "14:00",
+    enabled_patterns: set | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
     """
     Convenience function: detect all pattern types, backtest, and return
     a combined trades DataFrame plus per-pattern-type metrics.
+
+    *enabled_patterns* is a set of pattern name strings to detect.
+    If None, all patterns are enabled.  Disabled detectors are skipped
+    entirely (saves compute time).
 
     ATR-related params are forwarded to all detectors.
     Time-of-day filter removes entries before *earliest_entry* or after
     *latest_entry* (IST, HH:MM) — entries too late in the day don't have
     sufficient runway for the pattern target to be reached.
     """
+    if enabled_patterns is None:
+        enabled_patterns = {
+            "Triple Top", "Triple Bottom",
+            "Ascending Triangle", "Descending Triangle", "Symmetrical Triangle",
+            "Bull Flag", "Bear Flag", "Rectangle",
+        }
+
     atr_shared = dict(
         use_atr=use_atr,
         atr_period=atr_period,
@@ -1004,17 +1016,33 @@ def run_all_patterns(
 
     all_patterns = []
 
-    tt_params = {**atr_shared, **(triple_top_params or {})}
-    all_patterns.extend(detect_triple_tops(df, **tt_params))
+    if "Triple Top" in enabled_patterns:
+        tt_params = {**atr_shared, **(triple_top_params or {})}
+        all_patterns.extend(detect_triple_tops(df, **tt_params))
 
-    tb_params = {**atr_shared, **(triple_bottom_params or {})}
-    all_patterns.extend(detect_triple_bottoms(df, **tb_params))
+    if "Triple Bottom" in enabled_patterns:
+        tb_params = {**atr_shared, **(triple_bottom_params or {})}
+        all_patterns.extend(detect_triple_bottoms(df, **tb_params))
 
-    tri_params = triangle_params or {}
-    all_patterns.extend(detect_triangles(df, **tri_params))
+    # Triangle detector finds all three types; filter after detection
+    _any_triangle = enabled_patterns & {
+        "Ascending Triangle", "Descending Triangle", "Symmetrical Triangle"
+    }
+    if _any_triangle:
+        tri_params = triangle_params or {}
+        tri_results = detect_triangles(df, **tri_params)
+        all_patterns.extend(
+            p for p in tri_results if p["pattern"] in enabled_patterns
+        )
 
-    fr_params = flag_rect_params or {}
-    all_patterns.extend(detect_flags_rectangles(df, **fr_params))
+    # Flag/Rectangle detector finds all three types; filter after detection
+    _any_flag_rect = enabled_patterns & {"Bull Flag", "Bear Flag", "Rectangle"}
+    if _any_flag_rect:
+        fr_params = flag_rect_params or {}
+        fr_results = detect_flags_rectangles(df, **fr_params)
+        all_patterns.extend(
+            p for p in fr_results if p["pattern"] in enabled_patterns
+        )
 
     if not all_patterns:
         return pd.DataFrame(), {}
