@@ -1,14 +1,16 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { createChart, CrosshairMode } from 'lightweight-charts'
+import {
+  createChart,
+  CrosshairMode,
+  CandlestickSeries,
+  LineSeries,
+  createSeriesMarkers,
+} from 'lightweight-charts'
 
-export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, trades, onTradeClick }) {
+export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, trades }) {
   const containerRef = useRef(null)
   const chartRef = useRef(null)
-  const candleSeriesRef = useRef(null)
-  const upperLineRef = useRef(null)
-  const lowerLineRef = useRef(null)
 
-  // Convert datetime string to Unix timestamp
   const toTimestamp = useCallback((dateStr) => {
     return Math.floor(new Date(dateStr).getTime() / 1000)
   }, [])
@@ -49,8 +51,8 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
 
     chartRef.current = chart
 
-    // Candlestick series
-    const candleSeries = chart.addCandlestickSeries({
+    // Candlestick series (v5 API)
+    const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#26a69a',
       downColor: '#ef5350',
       borderUpColor: '#26a69a',
@@ -59,23 +61,36 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
       wickDownColor: '#ef5350',
     })
 
-    const candleData = chartData.map((d) => ({
-      time: toTimestamp(d.time),
-      open: d.open,
-      high: d.high,
-      low: d.low,
-      close: d.close,
-    }))
-    candleSeries.setData(candleData)
-    candleSeriesRef.current = candleSeries
+    // Deduplicate timestamps (keep last occurrence for each second)
+    const seen = new Map()
+    chartData.forEach((d) => {
+      const ts = toTimestamp(d.time)
+      seen.set(ts, d)
+    })
+    const uniqueData = Array.from(seen.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([ts, d]) => ({
+        time: ts,
+        open: d.open,
+        high: d.high,
+        low: d.low,
+        close: d.close,
+      }))
 
-    // Upper trendline (teal)
-    const upperData = chartData
-      .filter((d) => d.upper !== undefined)
-      .map((d) => ({ time: toTimestamp(d.time), value: d.upper }))
+    candleSeries.setData(uniqueData)
 
-    if (upperData.length > 0) {
-      const upperLine = chart.addLineSeries({
+    // Upper trendline (v5 API)
+    const upperEntries = chartData.filter((d) => d.upper !== undefined)
+    if (upperEntries.length > 0) {
+      const upperSeen = new Map()
+      upperEntries.forEach((d) => {
+        upperSeen.set(toTimestamp(d.time), d.upper)
+      })
+      const upperData = Array.from(upperSeen.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([ts, val]) => ({ time: ts, value: val }))
+
+      const upperLine = chart.addSeries(LineSeries, {
         color: '#26a69a',
         lineWidth: 1,
         lineStyle: 2,
@@ -84,16 +99,20 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
         lastValueVisible: false,
       })
       upperLine.setData(upperData)
-      upperLineRef.current = upperLine
     }
 
-    // Lower trendline (red)
-    const lowerData = chartData
-      .filter((d) => d.lower !== undefined)
-      .map((d) => ({ time: toTimestamp(d.time), value: d.lower }))
+    // Lower trendline (v5 API)
+    const lowerEntries = chartData.filter((d) => d.lower !== undefined)
+    if (lowerEntries.length > 0) {
+      const lowerSeen = new Map()
+      lowerEntries.forEach((d) => {
+        lowerSeen.set(toTimestamp(d.time), d.lower)
+      })
+      const lowerData = Array.from(lowerSeen.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([ts, val]) => ({ time: ts, value: val }))
 
-    if (lowerData.length > 0) {
-      const lowerLine = chart.addLineSeries({
+      const lowerLine = chart.addSeries(LineSeries, {
         color: '#ef5350',
         lineWidth: 1,
         lineStyle: 2,
@@ -102,10 +121,9 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
         lastValueVisible: false,
       })
       lowerLine.setData(lowerData)
-      lowerLineRef.current = lowerLine
     }
 
-    // Buy/Sell markers on candlestick series
+    // Build markers
     const markers = []
     if (buyMarkers) {
       buyMarkers.forEach((m) => {
@@ -129,8 +147,6 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
         })
       })
     }
-
-    // Add exit markers from trades
     if (trades) {
       trades.forEach((t) => {
         markers.push({
@@ -143,13 +159,16 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
       })
     }
 
+    // Deduplicate markers at same timestamp — keep all but sort
     markers.sort((a, b) => a.time - b.time)
-    candleSeries.setMarkers(markers)
 
-    // Fit content
+    // Use v5 createSeriesMarkers API
+    if (markers.length > 0) {
+      createSeriesMarkers(candleSeries, markers)
+    }
+
     chart.timeScale().fitContent()
 
-    // Resize handler
     const handleResize = () => {
       if (containerRef.current) {
         chart.applyOptions({ width: containerRef.current.clientWidth })
@@ -163,13 +182,6 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
       chartRef.current = null
     }
   }, [chartData, buyMarkers, sellMarkers, trades, toTimestamp])
-
-  // Scroll to trade when clicked in table
-  useEffect(() => {
-    if (onTradeClick && chartRef.current) {
-      // exposed via parent
-    }
-  }, [onTradeClick])
 
   return (
     <div className="bg-[#1a1d29] rounded-lg border border-[#2d3040] overflow-hidden">
@@ -189,11 +201,4 @@ export default function CandlestickChart({ chartData, buyMarkers, sellMarkers, t
       <div ref={containerRef} />
     </div>
   )
-}
-
-export function scrollChartToTrade(chartRef, trade, toTimestamp) {
-  if (chartRef.current && trade) {
-    const ts = toTimestamp(trade.entry_time)
-    chartRef.current.timeScale().scrollToPosition(-10, false)
-  }
 }
