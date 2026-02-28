@@ -1,5 +1,7 @@
 import { useState, useCallback } from 'react'
 import FileUpload from './components/Sidebar/FileUpload'
+import DateRangeFilter from './components/Sidebar/DateRangeFilter'
+import TimeframeSelect from './components/Sidebar/TimeframeSelect'
 import AlgoParams from './components/Sidebar/AlgoParams'
 import TradeParams from './components/Sidebar/TradeParams'
 import QuickStats from './components/Sidebar/QuickStats'
@@ -18,6 +20,7 @@ const DEFAULT_ALGO_PARAMS = {
 const DEFAULT_TRADE_PARAMS = {
   target_points: 50,
   stop_loss_points: 25,
+  sl_mode: 'fixed',
   trailing_stop: false,
   trail_activation: 30,
   trail_distance: 15,
@@ -26,10 +29,18 @@ const DEFAULT_TRADE_PARAMS = {
   exit_time: '15:10',
 }
 
+const DEFAULT_DATE_PARAMS = {
+  date_start: '',
+  date_end: '',
+}
+
 export default function App() {
   const [dataLoaded, setDataLoaded] = useState(false)
+  const [dataRange, setDataRange] = useState(null)
   const [algoParams, setAlgoParams] = useState(DEFAULT_ALGO_PARAMS)
   const [tradeParams, setTradeParams] = useState(DEFAULT_TRADE_PARAMS)
+  const [dateParams, setDateParams] = useState(DEFAULT_DATE_PARAMS)
+  const [timeframe, setTimeframe] = useState('1m')
   const [running, setRunning] = useState(false)
   const [error, setError] = useState(null)
 
@@ -44,7 +55,7 @@ export default function App() {
 
   const onDataLoaded = useCallback((data) => {
     setDataLoaded(true)
-    // Clear previous results
+    setDataRange(data.date_range)
     setChartData(null)
     setTrades(null)
     setEquityCurve(null)
@@ -58,7 +69,12 @@ export default function App() {
       const res = await fetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...algoParams, ...tradeParams }),
+        body: JSON.stringify({
+          ...algoParams,
+          ...tradeParams,
+          ...dateParams,
+          timeframe,
+        }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Backtest failed')
@@ -75,7 +91,7 @@ export default function App() {
     } finally {
       setRunning(false)
     }
-  }, [algoParams, tradeParams])
+  }, [algoParams, tradeParams, dateParams, timeframe])
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -101,6 +117,12 @@ export default function App() {
         {/* Sidebar */}
         <aside className="w-64 min-w-64 bg-[#1a1d29] border-r border-[#2d3040] p-3 overflow-y-auto flex flex-col">
           <FileUpload onDataLoaded={onDataLoaded} />
+
+          <div className="border-t border-[#2d3040] my-2"></div>
+          <DateRangeFilter params={dateParams} onChange={setDateParams} dataRange={dataRange} />
+
+          <div className="border-t border-[#2d3040] my-2"></div>
+          <TimeframeSelect value={timeframe} onChange={setTimeframe} />
 
           <div className="border-t border-[#2d3040] my-2"></div>
           <AlgoParams params={algoParams} onChange={setAlgoParams} />

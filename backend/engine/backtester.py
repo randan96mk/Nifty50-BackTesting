@@ -17,6 +17,7 @@ def run_backtest(
     sell_signals: list[int],
     target_points: float = 50.0,
     stop_loss_points: float = 25.0,
+    sl_mode: str = "fixed",
     trailing_stop: bool = False,
     trail_activation: float = 30.0,
     trail_distance: float = 15.0,
@@ -26,6 +27,10 @@ def run_backtest(
 ) -> dict:
     """
     Run trade simulation on OHLC data with given signals.
+
+    sl_mode:
+        "fixed"        - Use stop_loss_points from entry price
+        "break_candle" - Buy SL = previous candle low, Sell SL = previous candle high
 
     Returns:
         trades: list of trade records
@@ -86,11 +91,22 @@ def run_backtest(
         if sig and bar_time is not None:
             in_time_window = entry_start <= bar_time <= entry_end
 
+            # Compute SL based on mode
+            def _get_sl(direction):
+                if sl_mode == "break_candle" and i > 0:
+                    if direction == "LONG":
+                        # SL = previous candle's low
+                        return max(closes[i] - lows[i - 1], 1.0)
+                    else:
+                        # SL = previous candle's high
+                        return max(highs[i - 1] - closes[i], 1.0)
+                return stop_loss_points
+
             if sig == "BOTH":
                 # If we had a position, it was already closed above by reverse logic
                 # Open based on the last signal direction - prefer BUY
                 if in_time_window and active_trade is None:
-                    active_trade = _open_trade("LONG", i, closes[i], dt, target_points, stop_loss_points)
+                    active_trade = _open_trade("LONG", i, closes[i], dt, target_points, _get_sl("LONG"))
             elif sig == "BUY":
                 # Close short if active, open long
                 if active_trade is not None and active_trade["direction"] == "SHORT":
@@ -108,7 +124,7 @@ def run_backtest(
                     active_trade = None
 
                 if in_time_window and active_trade is None:
-                    active_trade = _open_trade("LONG", i, closes[i], dt, target_points, stop_loss_points)
+                    active_trade = _open_trade("LONG", i, closes[i], dt, target_points, _get_sl("LONG"))
 
             elif sig == "SELL":
                 if active_trade is not None and active_trade["direction"] == "LONG":
@@ -126,7 +142,7 @@ def run_backtest(
                     active_trade = None
 
                 if in_time_window and active_trade is None:
-                    active_trade = _open_trade("SHORT", i, closes[i], dt, target_points, stop_loss_points)
+                    active_trade = _open_trade("SHORT", i, closes[i], dt, target_points, _get_sl("SHORT"))
 
     # Close any remaining trade at last bar
     if active_trade is not None:

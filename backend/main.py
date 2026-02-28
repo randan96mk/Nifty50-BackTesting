@@ -33,9 +33,17 @@ class BacktestParams(BaseModel):
     mult: float = 1.0
     calc_method: str = "Atr"
 
+    # Date range filter (empty string = no filter)
+    date_start: str = ""
+    date_end: str = ""
+
+    # Candle timeframe resampling
+    timeframe: str = "1m"
+
     # Trade parameters
     target_points: float = 50.0
     stop_loss_points: float = 25.0
+    sl_mode: str = "fixed"  # "fixed" or "break_candle"
     trailing_stop: bool = False
     trail_activation: float = 30.0
     trail_distance: float = 15.0
@@ -80,13 +88,55 @@ async def run_backtest_endpoint(params: BacktestParams):
     if "current" not in uploaded_data:
         raise HTTPException(400, "No data uploaded. Please upload a file first.")
 
-    data = uploaded_data["current"]
+    raw = uploaded_data["current"]
 
-    datetimes = pd.to_datetime(data["datetimes"]).tolist()
-    opens = np.array(data["open"], dtype=float)
-    highs = np.array(data["high"], dtype=float)
-    lows = np.array(data["low"], dtype=float)
-    closes = np.array(data["close"], dtype=float)
+    # Build a DataFrame for filtering and resampling
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(raw["datetimes"]),
+        "open": np.array(raw["open"], dtype=float),
+        "high": np.array(raw["high"], dtype=float),
+        "low": np.array(raw["low"], dtype=float),
+        "close": np.array(raw["close"], dtype=float),
+    })
+
+    # --- Date range filter ---
+    if params.date_start:
+        df = df[df["datetime"] >= pd.to_datetime(params.date_start)]
+    if params.date_end:
+        df = df[df["datetime"] <= pd.to_datetime(params.date_end) + pd.Timedelta(days=1)]
+
+    if len(df) == 0:
+        raise HTTPException(400, "No data in selected date range.")
+
+    df = df.sort_values("datetime").reset_index(drop=True)
+
+    # --- Timeframe resampling ---
+    TIMEFRAME_MAP = {
+        "1m": "1min", "2m": "2min", "3m": "3min", "5m": "5min",
+        "10m": "10min", "15m": "15min", "30m": "30min", "1h": "1h",
+    }
+    tf_rule = TIMEFRAME_MAP.get(params.timeframe)
+    if tf_rule and params.timeframe != "1m":
+        df = df.set_index("datetime")
+        resampled = df.resample(tf_rule).agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }).dropna()
+        resampled = resampled.reset_index()
+        df = resampled
+
+    if len(df) == 0:
+        raise HTTPException(400, "No data after resampling. Check timeframe and date range.")
+
+    # Extract arrays for engine
+    datetimes_list = df["datetime"].tolist()
+    dt_strings = df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
 
     # Step 1: Calculate trendlines and signals
     trendline_result = calculate_trendlines(
@@ -100,7 +150,7 @@ async def run_backtest_endpoint(params: BacktestParams):
 
     # Step 2: Run trade simulation
     backtest_result = run_backtest(
-        datetimes=datetimes,
+        datetimes=datetimes_list,
         opens=opens,
         highs=highs,
         lows=lows,
@@ -109,6 +159,7 @@ async def run_backtest_endpoint(params: BacktestParams):
         sell_signals=trendline_result["sell_signals"],
         target_points=params.target_points,
         stop_loss_points=params.stop_loss_points,
+        sl_mode=params.sl_mode,
         trailing_stop=params.trailing_stop,
         trail_activation=params.trail_activation,
         trail_distance=params.trail_distance,
@@ -120,20 +171,19 @@ async def run_backtest_endpoint(params: BacktestParams):
     # Step 3: Calculate metrics
     metrics = calculate_metrics(backtest_result["trades"])
 
-    # Step 4: Prepare chart data (downsample trendlines for JSON transfer)
+    # Step 4: Prepare chart data
     n = len(closes)
     upper_line = trendline_result["upper_line"]
     lower_line = trendline_result["lower_line"]
 
-    # Build OHLC data with trendlines for chart
     chart_data = []
     for i in range(n):
         entry = {
-            "time": data["datetimes"][i],
-            "open": data["open"][i],
-            "high": data["high"][i],
-            "low": data["low"][i],
-            "close": data["close"][i],
+            "time": dt_strings[i],
+            "open": float(opens[i]),
+            "high": float(highs[i]),
+            "low": float(lows[i]),
+            "close": float(closes[i]),
         }
         if not np.isnan(upper_line[i]):
             entry["upper"] = round(float(upper_line[i]), 2)
@@ -141,25 +191,23 @@ async def run_backtest_endpoint(params: BacktestParams):
             entry["lower"] = round(float(lower_line[i]), 2)
         chart_data.append(entry)
 
-    # Signal markers
     buy_markers = [
-        {"time": data["datetimes"][i], "position": "belowBar", "color": "#26a69a",
-         "shape": "arrowUp", "text": "B", "price": data["low"][i]}
+        {"time": dt_strings[i], "position": "belowBar", "color": "#26a69a",
+         "shape": "arrowUp", "text": "B", "price": float(lows[i])}
         for i in trendline_result["buy_signals"]
     ]
     sell_markers = [
-        {"time": data["datetimes"][i], "position": "aboveBar", "color": "#ef5350",
-         "shape": "arrowDown", "text": "S", "price": data["high"][i]}
+        {"time": dt_strings[i], "position": "aboveBar", "color": "#ef5350",
+         "shape": "arrowDown", "text": "S", "price": float(highs[i])}
         for i in trendline_result["sell_signals"]
     ]
 
-    # Pivot markers
     pivot_high_markers = [
-        {"time": data["datetimes"][p["pivot_bar"]], "value": p["value"], "type": "high"}
+        {"time": dt_strings[p["pivot_bar"]], "value": p["value"], "type": "high"}
         for p in trendline_result["pivot_highs"]
     ]
     pivot_low_markers = [
-        {"time": data["datetimes"][p["pivot_bar"]], "value": p["value"], "type": "low"}
+        {"time": dt_strings[p["pivot_bar"]], "value": p["value"], "type": "low"}
         for p in trendline_result["pivot_lows"]
     ]
 
@@ -176,6 +224,8 @@ async def run_backtest_endpoint(params: BacktestParams):
             "buy": len(trendline_result["buy_signals"]),
             "sell": len(trendline_result["sell_signals"]),
         },
+        "candle_count": n,
+        "timeframe": params.timeframe,
     }
 
 
