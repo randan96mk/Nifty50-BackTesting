@@ -7,17 +7,29 @@ export default function TradeParams({ params, onChange }) {
         Trade Parameters
       </label>
       <div className="space-y-2">
-        <div className="grid grid-cols-2 gap-2">
-          <div>
-            <label className="text-xs text-gray-400 block mb-1">Target (pts)</label>
-            <input
-              type="number"
-              min={1}
-              step={5}
-              value={params.target_points}
-              onChange={(e) => update('target_points', parseFloat(e.target.value) || 50)}
-            />
-          </div>
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Target (pts)</label>
+          <input
+            type="number"
+            min={1}
+            step={5}
+            value={params.target_points}
+            onChange={(e) => update('target_points', parseFloat(e.target.value) || 50)}
+          />
+        </div>
+
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Stop Loss Mode</label>
+          <select
+            value={params.sl_mode}
+            onChange={(e) => update('sl_mode', e.target.value)}
+          >
+            <option value="fixed">Fixed Points</option>
+            <option value="break_candle">Break Candle</option>
+          </select>
+        </div>
+
+        {params.sl_mode === 'fixed' && (
           <div>
             <label className="text-xs text-gray-400 block mb-1">Stop Loss (pts)</label>
             <input
@@ -28,7 +40,14 @@ export default function TradeParams({ params, onChange }) {
               onChange={(e) => update('stop_loss_points', parseFloat(e.target.value) || 25)}
             />
           </div>
-        </div>
+        )}
+
+        {params.sl_mode === 'break_candle' && (
+          <div className="text-[10px] text-gray-500 bg-[#242736] rounded p-2 border border-[#2d3040]">
+            Buy SL = previous candle low<br />
+            Sell SL = previous candle high
+          </div>
+        )}
 
         <div className="flex items-center gap-2">
           <input
