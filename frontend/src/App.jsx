@@ -7,6 +7,7 @@ import CandlestickChart from './components/Charts/CandlestickChart'
 import EquityCurveChart from './components/Charts/EquityCurveChart'
 import TradeLogTable from './components/TradeLog/TradeLogTable'
 import PerformanceDashboard from './components/Dashboard/PerformanceDashboard'
+import ErrorBoundary from './components/ErrorBoundary'
 
 const DEFAULT_ALGO_PARAMS = {
   length: 14,
@@ -157,13 +158,17 @@ export default function App() {
             </div>
           ) : (
             <>
-              <CandlestickChart
-                chartData={chartData}
-                buyMarkers={buyMarkers}
-                sellMarkers={sellMarkers}
-                trades={trades}
-              />
-              <EquityCurveChart equityCurve={equityCurve} />
+              <ErrorBoundary>
+                <CandlestickChart
+                  chartData={chartData}
+                  buyMarkers={buyMarkers}
+                  sellMarkers={sellMarkers}
+                  trades={trades}
+                />
+              </ErrorBoundary>
+              <ErrorBoundary>
+                <EquityCurveChart equityCurve={equityCurve} />
+              </ErrorBoundary>
               <TradeLogTable trades={trades} />
               <PerformanceDashboard metrics={metrics} />
             </>

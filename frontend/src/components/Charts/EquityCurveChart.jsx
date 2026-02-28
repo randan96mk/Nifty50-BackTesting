@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { createChart } from 'lightweight-charts'
+import { createChart, AreaSeries } from 'lightweight-charts'
 
 export default function EquityCurveChart({ equityCurve }) {
   const containerRef = useRef(null)
@@ -37,8 +37,8 @@ export default function EquityCurveChart({ equityCurve }) {
 
     chartRef.current = chart
 
-    // Area series for equity curve
-    const areaSeries = chart.addAreaSeries({
+    // Area series (v5 API)
+    const areaSeries = chart.addSeries(AreaSeries, {
       topColor: 'rgba(38, 166, 154, 0.3)',
       bottomColor: 'rgba(38, 166, 154, 0.02)',
       lineColor: '#26a69a',
@@ -47,15 +47,20 @@ export default function EquityCurveChart({ equityCurve }) {
       crosshairMarkerRadius: 3,
     })
 
-    const data = equityCurve.map((d) => ({
-      time: Math.floor(new Date(d.datetime).getTime() / 1000),
-      value: d.cumulative_pnl,
-    }))
+    // Deduplicate timestamps
+    const seen = new Map()
+    equityCurve.forEach((d) => {
+      const ts = Math.floor(new Date(d.datetime).getTime() / 1000)
+      seen.set(ts, d.cumulative_pnl)
+    })
+    const data = Array.from(seen.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([ts, val]) => ({ time: ts, value: val }))
 
     areaSeries.setData(data)
     chart.timeScale().fitContent()
 
-    // Draw zero line
+    // Zero line
     areaSeries.createPriceLine({
       price: 0,
       color: '#8b8fa3',
